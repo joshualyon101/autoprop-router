@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 from pydantic import BaseModel, Field
-from .models import AccountConfig
+from models import AccountConfig
 
 
 class Settings(BaseModel):
@@ -17,7 +17,7 @@ class Settings(BaseModel):
     max_state_age_seconds: float = Field(default=20.0, ge=2.0)
     request_timeout_seconds: float = Field(default=4.0, ge=0.5)
     sqlite_path: str = "autoprop_router.sqlite3"
-    account_config_path: str = "config/accounts.json"
+    account_config_path: str = "accounts.json"
     default_execution_symbol: str = ""  # e.g. MNQU6; intentionally not hard-coded
     mnq_point_value: float = 2.0
     mnq_tick_size: float = 0.25
@@ -38,7 +38,7 @@ class Settings(BaseModel):
             max_state_age_seconds=float(os.getenv("MAX_STATE_AGE_SECONDS", "20")),
             request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "4")),
             sqlite_path=os.getenv("SQLITE_PATH", "autoprop_router.sqlite3"),
-            account_config_path=os.getenv("ACCOUNT_CONFIG_PATH", "config/accounts.json"),
+            account_config_path=os.getenv("ACCOUNT_CONFIG_PATH", "accounts.json"),
             default_execution_symbol=os.getenv("DEFAULT_EXECUTION_SYMBOL", ""),
             mnq_point_value=float(os.getenv("MNQ_POINT_VALUE", "2.0")),
             mnq_tick_size=float(os.getenv("MNQ_TICK_SIZE", "0.25")),

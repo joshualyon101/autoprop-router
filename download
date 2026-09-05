@@ -1,10 +1,6 @@
 __pycache__/
 .pytest_cache/
 *.pyc
-*.pyo
 *.sqlite3
 .env
 .git/
-.gitignore
-tests/
-BUILD_VALIDATION.txt

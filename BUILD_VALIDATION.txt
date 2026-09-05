@@ -1,8 +1,6 @@
-AutoProp Router v0.1 Railway build validation
-=============================================
-
-[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m                                                                  [100%][0m
-[32m[32m[1m7 passed[0m[32m in 0.13s[0m[0m
+Compile: PASS
+Smoke rc: 0
+AutoProp Router 0.1.0
 
 Spreadsheet runtime warmup failed during python startup
 Traceback (most recent call last):
@@ -14,3 +12,4 @@ Traceback (most recent call last):
   File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/remote.py", line 749, in __call__
   File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/client.py", line 150, in call
 artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.
+

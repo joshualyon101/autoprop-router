@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .models import AccountConfig, AccountRuntime, AccountPhase, DrawdownType, RiskProfile
+from models import AccountConfig, AccountRuntime, AccountPhase, DrawdownType, RiskProfile
 
 
 @dataclass(frozen=True)
