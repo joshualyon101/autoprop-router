@@ -1,15 +1,15 @@
 {
-  "trade_id": "APF-UNIQUE-ID",
+  "event_id": "{{strategy.order.id}}-{{time}}",
+  "trade_id": "APF-UNIQUE-LIFECYCLE-ID",
   "event": "ENTRY",
-  "engine": "ORG",
+  "engine": "CORE",
   "direction": "LONG",
   "instrument": "MNQ1!",
-  "contract_risk_dollars": 68.4,
   "entry": 23850.25,
   "stop": 23817.5,
-  "tp1": 23925.0,
-  "tp2": 23980.0,
-  "min_runner_qty": 2,
-  "breakeven_after_tp1": false,
-  "breakeven_offset_ticks": 0
+  "tp1": 23879.75,
+  "tp2": 23922.25,
+  "source_qty": 6,
+  "tp1_qty": 3,
+  "runner_qty": 3
 }
