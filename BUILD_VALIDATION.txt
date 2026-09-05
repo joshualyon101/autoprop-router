@@ -1,9 +1,6 @@
-AutoProp Router v0.1.1 ID-Safe validation
-=========================================
-
 Compile: PASS
-ID safety test rc: 0
-ID-safe duplicate-name test PASS
+v0.3 test rc: 0
+v0.3 live-canary + ATM + override + flatten tests PASS
 Spreadsheet runtime warmup failed during python startup
 Traceback (most recent call last):
   File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup
@@ -15,8 +12,8 @@ Traceback (most recent call last):
   File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/client.py", line 150, in call
 artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.
 
-Main startup smoke rc: 0
-AutoProp Router 0.1.0
+startup rc: 0
+AutoProp Router 0.3.0
 Spreadsheet runtime warmup failed during python startup
 Traceback (most recent call last):
   File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup

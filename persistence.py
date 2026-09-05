@@ -21,6 +21,31 @@ class Store:
     def _init(self):
         with self._conn() as c:
             c.executescript("""
+            CREATE TABLE IF NOT EXISTS account_overrides (
+                account_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS account_registry (
+                account_id TEXT PRIMARY KEY,
+                crosstrade_account_id INTEGER,
+                account_name TEXT NOT NULL,
+                firm TEXT NOT NULL,
+                program TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                starting_balance REAL NOT NULL,
+                max_loss REAL NOT NULL,
+                profit_target REAL NOT NULL,
+                max_micros INTEGER NOT NULL,
+                drawdown_type TEXT NOT NULL,
+                consistency_pct REAL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                rules_verified INTEGER NOT NULL DEFAULT 0,
+                risk_ready INTEGER NOT NULL DEFAULT 0,
+                profile_source TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS prop_state (
                 account_id TEXT PRIMARY KEY,
                 mll_floor REAL,
@@ -123,3 +148,92 @@ class Store:
                 "INSERT INTO route_log(trade_id,created_at,payload) VALUES(?,?,?)",
                 (trade_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload, separators=(",", ":")))
             )
+
+
+    def get_override(self, account_id: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT payload FROM account_overrides WHERE account_id=?",
+                (account_id,)
+            ).fetchone()
+            return json.loads(row["payload"]) if row else None
+
+    def set_override(self, account_id: str, payload: dict[str, Any]):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn() as c:
+            c.execute("""
+            INSERT INTO account_overrides(account_id,payload,updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(account_id) DO UPDATE SET
+              payload=excluded.payload, updated_at=excluded.updated_at
+            """, (account_id, json.dumps(payload, separators=(",", ":")), now))
+
+    def delete_override(self, account_id: str):
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM account_overrides WHERE account_id=?", (account_id,))
+
+    def list_overrides(self) -> dict[str, dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT account_id,payload FROM account_overrides").fetchall()
+            return {r["account_id"]: json.loads(r["payload"]) for r in rows}
+
+    def reset_prop_state(
+        self,
+        account_id: str,
+        *,
+        mll_floor: float | None = None,
+        peak_eod_balance: float | None = None,
+        live_high_water: float | None = None,
+        mll_locked: bool = False,
+    ):
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM prop_state WHERE account_id=?", (account_id,))
+        self.upsert_prop_state(
+            account_id,
+            mll_floor=mll_floor,
+            peak_eod_balance=peak_eod_balance,
+            live_high_water=live_high_water,
+            mll_locked=mll_locked,
+        )
+
+    def upsert_registry(self, cfg):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn() as c:
+            c.execute("""
+            INSERT INTO account_registry(
+              account_id,crosstrade_account_id,account_name,firm,program,phase,
+              starting_balance,max_loss,profit_target,max_micros,drawdown_type,
+              consistency_pct,enabled,rules_verified,risk_ready,profile_source,
+              first_seen,last_seen
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(account_id) DO UPDATE SET
+              crosstrade_account_id=excluded.crosstrade_account_id,
+              account_name=excluded.account_name,
+              firm=excluded.firm,
+              program=excluded.program,
+              phase=excluded.phase,
+              starting_balance=excluded.starting_balance,
+              max_loss=excluded.max_loss,
+              profit_target=excluded.profit_target,
+              max_micros=excluded.max_micros,
+              drawdown_type=excluded.drawdown_type,
+              consistency_pct=excluded.consistency_pct,
+              enabled=excluded.enabled,
+              rules_verified=excluded.rules_verified,
+              risk_ready=excluded.risk_ready,
+              profile_source=excluded.profile_source,
+              last_seen=excluded.last_seen
+            """, (
+                cfg.id, cfg.crosstrade_account_id, cfg.account_name, cfg.firm,
+                cfg.program, cfg.phase.value, cfg.starting_balance, cfg.max_loss,
+                cfg.profit_target, cfg.max_micros, cfg.drawdown_type.value,
+                cfg.consistency_pct, int(cfg.enabled), int(cfg.rules_verified),
+                int(cfg.risk_ready), cfg.profile_source, now, now
+            ))
+
+    def list_registry(self):
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM account_registry ORDER BY firm, account_name"
+            ).fetchall()]
+

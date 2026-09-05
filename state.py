@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from models import AccountConfig, AccountRuntime, DrawdownType
 from persistence import Store
 from crosstrade import CrossTradeClient
+from rules_profiles import infer_account_config
 
 
 _BALANCE_KEYS = (
@@ -91,6 +92,32 @@ def _find_list(obj: Any, keys: tuple[str, ...]) -> list[dict]:
     return []
 
 
+
+def _collect_account_records(snapshot: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def walk(obj: Any):
+        if isinstance(obj, dict):
+            aid = _record_account_id(obj)
+            name = _record_account_name(obj)
+            if aid is not None and name:
+                # Prefer account-level records, not nested rows.
+                if aid not in seen and (
+                    any(k in obj for k in _NETLIQ_KEYS + _BALANCE_KEYS)
+                    or "positions" in obj or "orders" in obj
+                ):
+                    out.append(obj)
+                    seen.add(aid)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+    walk(snapshot)
+    return out
+
+
 def _find_account_record(
     snapshot: Any,
     account_name: str | None,
@@ -121,10 +148,39 @@ def _find_account_record(
     return walk(snapshot)
 
 
+
+def _apply_manual_override(cfg: AccountConfig, override: dict[str, Any] | None) -> AccountConfig:
+    if not override:
+        return cfg
+    allowed = {
+        "firm", "program", "phase", "starting_balance", "max_loss",
+        "profit_target", "max_micros", "drawdown_type", "lock_offset",
+        "consistency_pct", "daily_loss_limit", "risk_profile",
+        "trading_day_start_et", "eod_snapshot_time_et",
+        "rules_verified", "risk_ready",
+        "bootstrap_mll_floor", "bootstrap_peak_eod_balance",
+        "bootstrap_live_high_water",
+    }
+    update = {k: v for k, v in override.items() if k in allowed}
+    update["profile_source"] = "manual_override"
+    merged = cfg.model_dump()
+    merged.update(update)
+    return AccountConfig.model_validate(merged)
+
+
 class AccountStateCache:
-    def __init__(self, accounts: list[AccountConfig], store: Store):
+    def __init__(
+        self,
+        accounts: list[AccountConfig],
+        store: Store,
+        *,
+        auto_discovery: bool = True,
+        fundednext_default_model: str = "Legacy",
+    ):
         self.accounts = {a.id: a for a in accounts}
         self.store = store
+        self.auto_discovery = auto_discovery
+        self.fundednext_default_model = fundednext_default_model
         self._state: dict[str, AccountRuntime] = {}
         self._lock = asyncio.Lock()
 
@@ -132,11 +188,50 @@ class AccountStateCache:
         async with self._lock:
             return copy.deepcopy(self._state)
 
+    async def configs_snapshot(self) -> list[AccountConfig]:
+        async with self._lock:
+            return copy.deepcopy(list(self.accounts.values()))
+
     async def update_from_snapshot(self, raw_snapshot: Any):
         now = datetime.now(timezone.utc)
         updates: dict[str, AccountRuntime] = {}
 
-        for a in self.accounts.values():
+        if self.auto_discovery:
+            for rec in _collect_account_records(raw_snapshot):
+                aid = _record_account_id(rec)
+                name = _record_account_name(rec)
+                if aid is None or not name:
+                    continue
+                rid = f"CT_{aid}"
+                effective = _first_number(rec, _BALANCE_KEYS)
+                if effective is None:
+                    effective = _first_number(rec, _NETLIQ_KEYS)
+
+                existing = self.accounts.get(rid)
+                if existing is None or existing.auto_discovered:
+                    cfg = infer_account_config(
+                        account_id=aid,
+                        account_name=name,
+                        effective_balance=effective,
+                        fundednext_default_model=self.fundednext_default_model,
+                    )
+                    override = self.store.get_override(rid)
+                    cfg = _apply_manual_override(cfg, override)
+
+                    # Preserve explicit bootstrap fields from the current in-memory config
+                    # unless the manual override supplied replacements.
+                    if existing is not None:
+                        if cfg.bootstrap_mll_floor is None:
+                            cfg.bootstrap_mll_floor = existing.bootstrap_mll_floor
+                        if cfg.bootstrap_peak_eod_balance is None:
+                            cfg.bootstrap_peak_eod_balance = existing.bootstrap_peak_eod_balance
+                        if cfg.bootstrap_live_high_water is None:
+                            cfg.bootstrap_live_high_water = existing.bootstrap_live_high_water
+
+                    self.accounts[rid] = cfg
+                    self.store.upsert_registry(cfg)
+
+        for a in list(self.accounts.values()):
             if a.crosstrade_account_id is None and (
                 not a.account_name or a.account_name.startswith("REPLACE_")
             ):
@@ -174,6 +269,12 @@ class AccountStateCache:
         now: datetime,
     ) -> AccountRuntime:
         persisted = self.store.get_prop_state(a.id) or {}
+
+        # v0.1 discovery used $1 placeholder profiles. Never carry that bogus
+        # floor into a real auto-classified prop profile.
+        if a.starting_balance >= 25000 and persisted.get("mll_floor") is not None:
+            if float(persisted.get("mll_floor") or 0) <= 1.01:
+                persisted = {}
 
         initial_floor = a.starting_balance - a.max_loss
         floor = persisted.get("mll_floor")
@@ -268,6 +369,16 @@ class AccountStateCache:
             trading_day_key=old_day,
             raw=raw,
         )
+
+    async def apply_override_now(self, account_id: str):
+        async with self._lock:
+            current = self.accounts.get(account_id)
+            if current is None:
+                raise KeyError(account_id)
+            override = self.store.get_override(account_id)
+            self.accounts[account_id] = _apply_manual_override(current, override)
+            self.store.upsert_registry(self.accounts[account_id])
+
 
     async def mark_eod(self, account_id: str, eod_balance: float):
         """Advance an EOD trailing floor from an authoritative completed-EOD balance."""

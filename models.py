@@ -59,6 +59,11 @@ class AccountConfig(BaseModel):
     bootstrap_peak_eod_balance: float | None = None
     bootstrap_live_high_water: float | None = None
 
+    # Dynamic registry metadata.
+    auto_discovered: bool = False
+    profile_source: str = "static"
+    risk_ready: bool = False
+
     @property
     def lock_level(self) -> float:
         return self.starting_balance + self.lock_offset
@@ -129,6 +134,10 @@ class TradeSignal(BaseModel):
 
     # Used by Fusion's consistency size-first / target-clipping logic.
     min_runner_qty: int = Field(default=2, ge=1, le=100)
+
+    # Optional broker-native management. False keeps both ATM tiers fixed.
+    breakeven_after_tp1: bool = False
+    breakeven_offset_ticks: int = Field(default=0, ge=0, le=100)
 
     @model_validator(mode="after")
     def validate_entry(self):

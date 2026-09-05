@@ -1,4 +1,4 @@
-# AutoProp Router v0.1 — Tradovate / CrossTrade
+# AutoProp Router v0.3.0 — Tradovate / CrossTrade
 
 
 ## Recommended production host: Render
@@ -236,3 +236,15 @@ Do not arm live execution until shadow quantities are compared trade-for-trade w
 5. Enable **shadow** account routing only.
 6. Feed real AutoProp alerts and compare Router quantity vs Pine quantity.
 7. Only after parity: simulator order submission and latency benchmarking.
+
+
+## v0.2 dynamic farm management
+
+CrossTrade is now the authoritative account inventory. New linked Tradovate accounts are discovered from background snapshots and added to the Router automatically.
+
+Manual account participation is controlled in CrossTrade's Tradovate Account Manager with **Block Signals**. The Router intentionally does not require TradingView alert edits or a second manual account list.
+
+Recognized new accounts are classified from their CrossTrade/Tradovate naming pattern and starting balance. Unrecognized plans are quarantined rather than assigned guessed rules.
+
+
+See `UPGRADE_v0.3.0_LIVE_READY.md` for the current deployment and live-canary procedure.

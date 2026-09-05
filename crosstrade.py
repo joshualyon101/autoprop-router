@@ -66,6 +66,11 @@ class CrossTradeClient:
         stop_loss: float | None = None,
         require_market_position: str | None = None,
         max_positions: int | None = None,
+        atm_targets: str | None = None,
+        atm_stops: str | None = None,
+        atm_qtys: str | None = None,
+        atm_breakeven: int | None = None,
+        atm_breakeven_offset: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "instrument": instrument,
@@ -74,11 +79,23 @@ class CrossTradeClient:
             "orderType": "market",
             "tif": "day",
             "orderId": order_id,
+            "text": "AutoProp Router",
         }
-        if take_profit is not None:
-            payload["takeProfit"] = take_profit
-        if stop_loss is not None:
-            payload["stopLoss"] = stop_loss
+        if atm_targets is not None:
+            payload["atmTargets"] = atm_targets
+            payload["atmStops"] = atm_stops
+            if atm_qtys is not None:
+                payload["atmQtys"] = atm_qtys
+            if atm_breakeven is not None:
+                payload["atmBreakeven"] = atm_breakeven
+            if atm_breakeven_offset is not None:
+                payload["atmBreakevenOffset"] = atm_breakeven_offset
+        else:
+            if take_profit is not None:
+                payload["takeProfit"] = take_profit
+            if stop_loss is not None:
+                payload["stopLoss"] = stop_loss
+
         if require_market_position:
             payload["requireMarketPosition"] = require_market_position
         if max_positions is not None:
@@ -86,3 +103,14 @@ class CrossTradeClient:
 
         url = f"/v1/api/tv/accounts/{quote(account, safe='')}/orders/place"
         return await self._json(await self.client.post(url, json=payload))
+
+    async def flatten_position(
+        self,
+        *,
+        account: str,
+        instrument: str,
+    ) -> dict[str, Any]:
+        url = f"/v1/api/tv/accounts/{quote(account, safe='')}/positions/flatten"
+        return await self._json(
+            await self.client.post(url, json={"instrument": instrument})
+        )
