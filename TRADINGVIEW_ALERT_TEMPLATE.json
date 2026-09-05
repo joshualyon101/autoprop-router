@@ -1,0 +1,14 @@
+{
+  "trade_id": "{{REPLACE_WITH_PINE_GENERATED_UNIQUE_TRADE_ID}}",
+  "event": "ENTRY",
+  "engine": "{{REPLACE_WITH_ENGINE}}",
+  "direction": "{{REPLACE_WITH_LONG_OR_SHORT}}",
+  "instrument": "MNQ1!",
+  "contract_risk_dollars": "{{REPLACE_WITH_PINE_SETUP_CONTRACT_RISK}}",
+  "entry": "{{REPLACE_WITH_ENTRY}}",
+  "stop": "{{REPLACE_WITH_STOP}}",
+  "tp1": "{{REPLACE_WITH_TP1}}",
+  "tp2": "{{OPTIONAL_TP2}}",
+  "emitted_at_ms": "{{OPTIONAL_UNIX_MS}}",
+  "min_runner_qty": 2
+}
