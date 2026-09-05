@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
     await client.close()
 
 
-app = FastAPI(title="AutoProp Router", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AutoProp Router", version="0.1.1", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -54,6 +54,17 @@ async def health():
         "state_poll_seconds": settings.state_poll_seconds,
         "max_state_age_seconds": settings.max_state_age_seconds,
     }
+
+
+@app.get("/admin/discover/{hook_token}")
+async def discover_linked_accounts(hook_token: str):
+    """Protected read-only passthrough of CrossTrade linked Tradovate accounts."""
+    if not settings.webhook_token or hook_token != settings.webhook_token:
+        raise HTTPException(404, "Not found")
+    if not settings.crosstrade_token:
+        raise HTTPException(503, "CROSSTRADE_TOKEN is not configured")
+    raw = await client.get_accounts()
+    return raw
 
 
 @app.get("/accounts")

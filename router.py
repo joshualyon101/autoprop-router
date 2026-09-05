@@ -136,7 +136,7 @@ class AutoPropRouter:
                 continue
 
             d = RouteDecision(
-                account_id=a.id, account_name=a.account_name, eligible=True,
+                account_id=a.id, account_name=s.account_name, eligible=True,
                 reason=rr.reason, quantity=routed_qty,
                 risk_budget=rr.budget, contract_risk=rr.contract_risk,
                 cushion=s.cushion, mll_floor=s.mll_floor, cache_age_ms=age_ms,
@@ -162,7 +162,7 @@ class AutoPropRouter:
         async def send(a: AccountConfig, d: RouteDecision):
             try:
                 d.execution_result = await self.client.place_order(
-                    account=a.account_name,
+                    account=d.account_name,
                     instrument=symbol,
                     action=action,
                     qty=d.quantity,

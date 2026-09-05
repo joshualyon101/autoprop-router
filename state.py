@@ -17,6 +17,26 @@ _BALANCE_KEYS = (
 )
 _NETLIQ_KEYS = ("netLiq", "net_liq", "netLiquidation", "netLiquidationValue", "equity")
 _NAME_KEYS = ("accountName", "account", "name")
+_ACCOUNT_ID_KEYS = ("accountId", "account_id", "id")
+
+
+def _record_account_id(obj: dict[str, Any]) -> int | None:
+    for k in _ACCOUNT_ID_KEYS:
+        v = obj.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    return None
+
+
+def _record_account_name(obj: dict[str, Any]) -> str | None:
+    for k in _NAME_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
 ET = ZoneInfo("America/New_York")
 
 
@@ -71,14 +91,21 @@ def _find_list(obj: Any, keys: tuple[str, ...]) -> list[dict]:
     return []
 
 
-def _find_account_record(snapshot: Any, account_name: str) -> dict[str, Any] | None:
-    target = account_name.lower()
+def _find_account_record(
+    snapshot: Any,
+    account_name: str | None,
+    account_id: int | None = None,
+) -> dict[str, Any] | None:
+    target = (account_name or "").lower()
 
     def walk(obj: Any) -> dict[str, Any] | None:
         if isinstance(obj, dict):
-            for k in _NAME_KEYS:
-                v = obj.get(k)
-                if isinstance(v, str) and v.lower() == target:
+            # Unique numeric ID wins. This avoids ambiguity when display names repeat.
+            if account_id is not None and _record_account_id(obj) == account_id:
+                return obj
+            if account_id is None and target:
+                n = _record_account_name(obj)
+                if n and n.lower() == target:
                     return obj
             for v in obj.values():
                 r = walk(v)
@@ -110,9 +137,13 @@ class AccountStateCache:
         updates: dict[str, AccountRuntime] = {}
 
         for a in self.accounts.values():
-            if not a.account_name or a.account_name.startswith("REPLACE_"):
+            if a.crosstrade_account_id is None and (
+                not a.account_name or a.account_name.startswith("REPLACE_")
+            ):
                 continue
-            rec = _find_account_record(raw_snapshot, a.account_name)
+            rec = _find_account_record(
+                raw_snapshot, a.account_name, a.crosstrade_account_id
+            )
             if rec is None:
                 continue
 
@@ -219,7 +250,7 @@ class AccountStateCache:
         cushion = None if effective_balance is None else max(0.0, effective_balance - float(floor))
         return AccountRuntime(
             account_id=a.id,
-            account_name=a.account_name,
+            account_name=_record_account_name(raw) or a.account_name,
             balance=balance,
             net_liq=net_liq,
             mll_floor=float(floor),

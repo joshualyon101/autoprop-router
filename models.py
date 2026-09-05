@@ -27,6 +27,8 @@ class RiskProfile(str, Enum):
 
 class AccountConfig(BaseModel):
     id: str
+    # Stable Tradovate/CrossTrade account ID. Prefer this for identity matching.
+    crosstrade_account_id: int | None = None
     account_name: str
     firm: str
     program: str
