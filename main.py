@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -10,17 +11,94 @@ from pydantic import BaseModel
 
 from version import __version__
 from config import load_accounts, load_risk_states
-from events import parse_alert
+from events import parse_alert, stable_event_id
 from live import LiveRouter
 from models import VerifiedRiskState
 from readiness import readiness
 from settings import Settings
-from state import StateUnverified
+from state import StateUnverified, ny_date
 from store import Store
 
 settings = Settings()
 store = Store(settings.SQLITE_PATH)
 app = FastAPI(title='AutoProp Router', version=__version__)
+
+_worker_task: asyncio.Task | None = None
+_worker_wakeup: asyncio.Event | None = None
+
+
+async def _process_event(event):
+    rt = _runtime()
+    if event.kind == 'ENTRY':
+        return await rt.route_entry(event)
+    if event.kind == 'MARKET_PULSE':
+        return await rt.market_pulse(event)
+    if event.kind == 'SILVER_STOP_MOVE':
+        return await rt.silver_stop(event)
+    if event.kind == 'HARD_FLAT':
+        return await rt.hard_flat(event)
+    if event.kind == 'EXIT':
+        return await rt.ordinary_exit(event)
+    return {'accepted': True, 'kind': event.kind, 'action': 'observed_no_mutation'}
+
+
+async def _webhook_worker():
+    # Serial execution keeps account mutation ordering deterministic while the HTTP
+    # ingress stays fast. Every item is already durable in SQLite before this loop sees it.
+    global _worker_wakeup
+    while True:
+        row = store.claim_next_webhook()
+        if row is None:
+            if _worker_wakeup is None:
+                await asyncio.sleep(0.25)
+                continue
+            _worker_wakeup.clear()
+            try:
+                await asyncio.wait_for(_worker_wakeup.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        key = row['event_key']
+        try:
+            event = parse_alert(row['raw'])
+            base = readiness(settings, _accounts())
+            if not settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
+                raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
+            if not base['configuration_ready']:
+                raise RuntimeError(f"router configuration not ready: {base['problems']}")
+            result = await _process_event(event)
+            store.complete_webhook(key, result)
+        except asyncio.CancelledError:
+            # Leave PROCESSING durable; startup recovery will requeue it.
+            raise
+        except Exception as exc:
+            store.fail_webhook(key, str(exc))
+        finally:
+            try:
+                store.prune_dedupe(settings.DEDUPE_RETENTION_DAYS)
+            except Exception:
+                pass
+
+
+@app.on_event('startup')
+async def _start_worker():
+    global _worker_task, _worker_wakeup
+    store.recover_processing_webhooks()
+    _worker_wakeup = asyncio.Event()
+    _worker_task = asyncio.create_task(_webhook_worker(), name='autoprop-webhook-worker')
+    _worker_wakeup.set()
+
+
+@app.on_event('shutdown')
+async def _stop_worker():
+    global _worker_task
+    if _worker_task is not None:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        _worker_task = None
 
 
 def _accounts():
@@ -239,6 +317,17 @@ def legacy_inspect(token: str):
     return {'legacy_path': str(legacy_path), 'exists': True, 'tables': out}
 
 
+@app.get('/admin/webhook-inbox/{token}')
+def webhook_inbox(token: str, limit: int = 50):
+    _auth(token)
+    rows = store.webhook_rows(limit)
+    counts = {'PENDING': 0, 'PROCESSING': 0, 'DONE': 0, 'FAILED': 0}
+    for row in rows:
+        status = str(row.get('status') or '')
+        counts[status] = counts.get(status, 0) + 1
+    return {'version': __version__, 'counts': counts, 'events': rows}
+
+
 @app.post('/webhook/tradingview/{token}')
 async def webhook(token: str, request: Request):
     _auth(token)
@@ -256,21 +345,18 @@ async def webhook(token: str, request: Request):
     if not base['configuration_ready']:
         raise HTTPException(503, {'reason': 'router configuration not ready', 'problems': base['problems']})
 
-    rt = _runtime()
-    try:
-        if event.kind == 'ENTRY':
-            return await rt.route_entry(event)
-        if event.kind == 'MARKET_PULSE':
-            return await rt.market_pulse(event)
-        if event.kind == 'SILVER_STOP_MOVE':
-            return await rt.silver_stop(event)
-        if event.kind == 'HARD_FLAT':
-            return await rt.hard_flat(event)
-        if event.kind == 'EXIT':
-            return await rt.ordinary_exit(event)
-        return {'accepted': True, 'kind': event.kind, 'action': 'observed_no_mutation'}
-    finally:
-        try:
-            store.prune_dedupe(settings.DEDUPE_RETENTION_DAYS)
-        except Exception:
-            pass
+    # Durable fast-ACK contract: validate -> commit raw event to SQLite -> return 200.
+    # The worker performs CrossTrade state/risk/execution after the response, so TradingView
+    # is never forced to wait through seven-account broker I/O.  The NY date keeps identical
+    # required-flat messages valid on future trading days while deduping same-day retries.
+    event_key = f"{stable_event_id(raw)}:{ny_date(datetime.now(timezone.utc))}"
+    inserted = store.enqueue_webhook(event_key, raw, event.kind)
+    if _worker_wakeup is not None:
+        _worker_wakeup.set()
+    return {
+        'accepted': True,
+        'queued': inserted,
+        'duplicate': not inserted,
+        'kind': event.kind,
+        'event_key': event_key,
+    }
