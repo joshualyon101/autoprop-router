@@ -8,15 +8,15 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-from . import __version__
-from .config import load_accounts, load_risk_states
-from .events import parse_alert
-from .live import LiveRouter
-from .models import VerifiedRiskState
-from .readiness import readiness
-from .settings import Settings
-from .state import StateUnverified
-from .store import Store
+from version import __version__
+from config import load_accounts, load_risk_states
+from events import parse_alert
+from live import LiveRouter
+from models import VerifiedRiskState
+from readiness import readiness
+from settings import Settings
+from state import StateUnverified
+from store import Store
 
 settings = Settings()
 store = Store(settings.SQLITE_PATH)

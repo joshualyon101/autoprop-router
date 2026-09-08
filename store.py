@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from .models import ActiveTrade, VerifiedRiskState
+from models import ActiveTrade, VerifiedRiskState
 
 
 class Store:

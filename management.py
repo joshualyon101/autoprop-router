@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from .models import ActiveTrade, MarketPulse
+from models import ActiveTrade, MarketPulse
 
 TICK = 0.25
 

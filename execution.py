@@ -4,8 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError
-from .models import Allocation
+from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError
+from models import Allocation
 
 TICK = 0.25
 

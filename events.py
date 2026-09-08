@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from .models import CanonicalPlan, MarketPulse
+from models import CanonicalPlan, MarketPulse
 
 
 @dataclass(frozen=True)

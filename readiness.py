@@ -1,6 +1,6 @@
 from __future__ import annotations
-from .models import AccountRule
-from .settings import Settings
+from models import AccountRule
+from settings import Settings
 
 
 def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:

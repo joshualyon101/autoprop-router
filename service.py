@@ -10,11 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from .allocation import allocate, AllocationBlocked
-from .events import ParsedEvent
-from .models import AccountRule, AccountState, Allocation
-from .org_reentry import prove_prior_org_stop
-from .store import Store
+from allocation import allocate, AllocationBlocked
+from events import ParsedEvent
+from models import AccountRule, AccountState, Allocation
+from org_reentry import prove_prior_org_stop
+from store import Store
 
 
 @dataclass

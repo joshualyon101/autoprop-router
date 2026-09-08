@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .models import AccountRule, AccountState, Allocation, CanonicalPlan
-from .parity import (
+from models import AccountRule, AccountState, Allocation, CanonicalPlan
+from parity import (
     MNQ_POINT_VALUE, challenge_effective_target, challenge_planning_ceiling,
     challenge_risk, funded_postlock_risk, funded_prelock_risk, daily_loss_limit,
     consistency_qty, consistency_target, core_consistency_qty, core_consistency_targets,
