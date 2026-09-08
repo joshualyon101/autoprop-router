@@ -1,6 +1,2 @@
-__pycache__/
-.pytest_cache/
-*.pyc
-*.sqlite3
-.env
-.git/
+# Created by pytest automatically.
+*

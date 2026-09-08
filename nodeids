@@ -1,0 +1,4 @@
+[
+  "test_rc3_state_refresh.py::test_cash_timestamp_falls_back_to_live_observation_time",
+  "test_rc3_state_refresh.py::test_runtime_durable_fill_read_proves_daily_ledger_even_if_staged_flag_false"
+]

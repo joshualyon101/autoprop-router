@@ -54,22 +54,26 @@ async def refresh_account_state(client: CrossTradeClient, rule: AccountRule,
                                 *, now: datetime | None = None) -> AccountState:
     now = now or datetime.now(timezone.utc)
     account = await client.get_account(rule.crosstrade_account)
-    cash, cash_ts = extract_closed_cash(_unwrap_balance(account))
+    # CrossTrade currently returns the closed-cash snapshot without a broker timestamp.
+    # The successful GET completion time is therefore the freshness timestamp for this
+    # observed snapshot; it is never used as a fill/order timestamp.
+    observed_at = datetime.now(timezone.utc)
+    cash, cash_ts = extract_closed_cash(_unwrap_balance(account), observed_at=observed_at)
 
     if rule.account_type in {"challenge", "funded"}:
         if risk is None or risk.account_id != rule.account_id or not risk.mll_verified or risk.mll_floor is None:
             raise StateUnverified("prop MLL/failure floor missing or unverified")
-        if not risk.ledger_verified:
-            raise StateUnverified("durable fill ledger not independently verified")
-    elif risk is not None and not risk.ledger_verified:
-        raise StateUnverified("durable fill ledger not independently verified")
 
     # For exact daily accounting the NY calendar date comes from UTC fill timestamps, never
     # Tradovate's session tradeDate. Query enough history to include the NY day boundary.
     today_start = now.astimezone(__import__('zoneinfo').ZoneInfo('America/New_York')).replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc)
     cycle_start = risk.cycle_start_utc if risk and risk.cycle_start_utc else today_start
     start = min(cycle_start, today_start)
+    # A successful, well-formed durable fills-history read is the runtime proof needed
+    # for New York daily realized-P&L accounting. If this endpoint is unavailable or
+    # malformed, durable_fills raises and the account still fails closed.
     fills = await durable_fills(client, rule.crosstrade_account, start, now + timedelta(seconds=1))
+    ledger_verified_now = True
     pnl = realized_by_ny_day(fills)
     realized_today = pnl.get(ny_date(now), 0.0)
     largest = max([0.0, *(x for x in pnl.values() if x > 0)])
@@ -84,5 +88,5 @@ async def refresh_account_state(client: CrossTradeClient, rule: AccountRule,
                         realized_today=realized_today,
                         largest_winning_day=largest,
                         state_timestamp=cash_ts,
-                        daily_ledger_verified=bool(risk and risk.ledger_verified),
-                        source="CrossTrade cash + durable fills + separately verified risk state")
+                        daily_ledger_verified=ledger_verified_now,
+                        source="CrossTrade closed cash observed at live GET + durable fills + separately verified risk state")

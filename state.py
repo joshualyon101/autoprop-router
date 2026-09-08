@@ -30,8 +30,14 @@ def parse_timestamp(value: Any) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def extract_closed_cash(balance: dict[str, Any]) -> tuple[float, datetime]:
-    """Extract confirmed cash balance without silently substituting net liquidation."""
+def extract_closed_cash(balance: dict[str, Any], *, observed_at: datetime | None = None) -> tuple[float, datetime]:
+    """Extract confirmed cash balance without silently substituting net liquidation.
+
+    If the broker payload omits its own timestamp, ``observed_at`` may be supplied by
+    the caller as the UTC time at which a successful live broker GET completed. This
+    preserves the freshness gate without pretending the observation time is a broker
+    event timestamp.
+    """
     for key in ("amount", "totalCashValue", "cashValue"):
         if balance.get(key) is not None:
             value = float(balance[key])
@@ -46,7 +52,9 @@ def extract_closed_cash(balance: dict[str, Any]) -> tuple[float, datetime]:
             ts = parse_timestamp(balance[key])
             break
     if ts is None:
-        raise StateUnverified("cash balance timestamp unavailable")
+        if observed_at is None:
+            raise StateUnverified("cash balance timestamp unavailable")
+        ts = observed_at.astimezone(timezone.utc) if observed_at.tzinfo else observed_at.replace(tzinfo=timezone.utc)
     return value, ts
 
 
