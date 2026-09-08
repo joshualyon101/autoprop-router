@@ -38,8 +38,14 @@ class LiveRouter:
         self.settings = settings
         self.accounts = accounts
         self.store = store
-        self.client = CrossTradeClient(settings.CROSSTRADE_BASE_URL, settings.CROSSTRADE_TOKEN,
-                                       settings.REQUEST_TIMEOUT_SECONDS)
+        self.client = CrossTradeClient(
+            settings.CROSSTRADE_BASE_URL, settings.CROSSTRADE_TOKEN,
+            settings.REQUEST_TIMEOUT_SECONDS,
+            settings.CROSSTRADE_RATE_LIMIT_PER_MINUTE,
+            settings.CROSSTRADE_RATE_LIMIT_WINDOW_SECONDS,
+            settings.CROSSTRADE_RATE_LIMIT_MAX_RETRIES,
+            settings.CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS,
+        )
         self.executor = Executor(self.client,
                                  bracket_confirm_retries=settings.BRACKET_CONFIRM_RETRIES,
                                  bracket_confirm_delay=settings.BRACKET_CONFIRM_RETRY_DELAY_SECONDS,
