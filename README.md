@@ -1,4 +1,4 @@
-# AutoProp Router v1.2.2 — Exact Parity Production RC1
+# AutoProp Router v1.2.3 — Exact Parity Production RC2
 
 Production-wired release candidate for AutoProp ICT Fusion v1.1.5 DUAL ROUTE RC3 in **Railway Router** mode.
 
@@ -73,7 +73,7 @@ Use `.env.example` as the canonical list. Secrets and live account registry/risk
 For migration safety the default database is:
 
 ```text
-SQLITE_PATH=/data/autoprop_router_v122.sqlite3
+SQLITE_PATH=/data/autoprop_router_v123.sqlite3
 ```
 
 Do not point this RC at the legacy `/data/autoprop_router.sqlite3` unless a separate migration has been performed.
@@ -107,3 +107,12 @@ Do not wrap the message in extra JSON. Recreate the alert after any Pine version
 ## First-live acceptance
 
 The first broker-mutating trade remains an acceptance test. It should be watched while awake. Confirm exact participating accounts, quantities, targets, Core split, protective orders, no duplicates, and management transitions before treating the system as unattended production.
+
+
+## Legacy state recovery
+
+For migration from the previously deployed Router, this RC adds a read-only inspector:
+
+GET /admin/legacy-inspect/<WEBHOOK_TOKEN>
+
+It opens /data/autoprop_router.sqlite3 in SQLite read-only mode, lists non-system tables and up to 200 rows per table, and redacts columns whose names look like secrets/tokens/passwords. It does not mutate the legacy database. Use it only while TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false, then migrate the verified account/risk state into ACCOUNT_CONFIG_JSON / RISK_STATE_JSON.

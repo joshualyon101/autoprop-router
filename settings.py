@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     CROSSTRADE_BASE_URL: str = 'https://app.crosstrade.io'
     CROSSTRADE_TOKEN: str = ''
     AUTOPROP_WEBHOOK_TOKEN: str = ''
-    SQLITE_PATH: str = '/data/autoprop_router_v122.sqlite3'
+    SQLITE_PATH: str = '/data/autoprop_router_v123.sqlite3'
     ACCOUNT_CONFIG_PATH: str = '/data/accounts.json'
     ACCOUNT_CONFIG_JSON: str = ''
     RISK_STATE_JSON: str = ''

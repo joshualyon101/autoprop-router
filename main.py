@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
@@ -204,6 +205,38 @@ def storage(token: str):
         'largest_files': files[:25],
         'sqlite_tables': store.table_inventory(),
     }
+
+
+@app.get('/admin/legacy-inspect/{token}')
+def legacy_inspect(token: str):
+    _auth(token)
+    legacy_path = Path('/data/autoprop_router.sqlite3')
+    if not legacy_path.exists():
+        return {'legacy_path': str(legacy_path), 'exists': False, 'tables': []}
+    uri = f"file:{legacy_path}?mode=ro"
+    out = []
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()]
+        for name in names:
+            safe_name = name.replace('"', '""')
+            cols = [dict(r) for r in conn.execute(f'PRAGMA table_info("{safe_name}")').fetchall()]
+            rows = []
+            try:
+                raw_rows = conn.execute(f'SELECT * FROM "{safe_name}" LIMIT 200').fetchall()
+                for rr in raw_rows:
+                    item = dict(rr)
+                    for key in list(item):
+                        lk = key.lower()
+                        if any(secret in lk for secret in ('token','secret','password','api_key','apikey','webhook')):
+                            item[key] = '<redacted>'
+                    rows.append(item)
+            except Exception as exc:
+                rows = [{'error': str(exc)}]
+            out.append({'table': name, 'columns': cols, 'rows': rows})
+    return {'legacy_path': str(legacy_path), 'exists': True, 'tables': out}
 
 
 @app.post('/webhook/tradingview/{token}')

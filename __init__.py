@@ -1,1 +1,1 @@
-__version__ = "1.2.2-exact-parity-production-rc1"
+__version__ = "1.2.3-exact-parity-production-rc2"
