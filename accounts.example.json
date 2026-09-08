@@ -1,3 +1,20 @@
 {
-  "accounts": []
+  "accounts": [
+    {
+      "account_id": "CT_EXAMPLE",
+      "crosstrade_account": "EXAMPLE_ACCOUNT_NAME",
+      "enabled": false,
+      "rules_verified": false,
+      "account_type": "challenge",
+      "profile": "standard",
+      "starting_balance": 100000,
+      "max_loss": 1,
+      "max_contracts": 1,
+      "drawdown": "eod",
+      "challenge_target": 1,
+      "challenge_consistency_enabled": false,
+      "challenge_consistency_pct": 40,
+      "notes": "Template only. Replace all placeholder rules from a verified live account record before enabling. Do not commit secrets or unnecessary account identifiers."
+    }
+  ]
 }

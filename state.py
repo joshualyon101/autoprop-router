@@ -1,478 +1,126 @@
 from __future__ import annotations
 
-import asyncio
-import copy
-from datetime import datetime, timezone, timedelta
-from typing import Any
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from typing import Any, Iterable
 
-from models import AccountConfig, AccountRuntime, DrawdownType
-from persistence import Store
-from crosstrade import CrossTradeClient
-from rules_profiles import infer_account_config
+NY = ZoneInfo("America/New_York")
 
 
-_BALANCE_KEYS = (
-    "cashBalance", "cash_balance", "balance", "accountBalance", "closedBalance",
-    "realizedBalance", "amount"
-)
-_NETLIQ_KEYS = ("netLiq", "net_liq", "netLiquidation", "netLiquidationValue", "equity")
-_NAME_KEYS = ("accountName", "account", "name")
-_ACCOUNT_ID_KEYS = ("accountId", "account_id", "id")
+class StateUnverified(RuntimeError):
+    pass
 
 
-def _record_account_id(obj: dict[str, Any]) -> int | None:
-    for k in _ACCOUNT_ID_KEYS:
-        v = obj.get(k)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str) and v.isdigit():
-            return int(v)
-    return None
+def parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        # CrossTrade timestamps may be ms or seconds.
+        v = float(value)
+        dt = datetime.fromtimestamp(v / 1000.0 if v > 1e12 else v, tz=timezone.utc)
+    elif isinstance(value, str):
+        text = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    else:
+        raise StateUnverified("missing broker timestamp")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def _record_account_name(obj: dict[str, Any]) -> str | None:
-    for k in _NAME_KEYS:
-        v = obj.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-ET = ZoneInfo("America/New_York")
-
-
-def _hhmm(value: str) -> tuple[int, int]:
-    h, m = value.split(":", 1)
-    return int(h), int(m)
-
-
-def _trading_day_key(now_utc: datetime, start_et: str) -> str:
-    local = now_utc.astimezone(ET)
-    h, m = _hhmm(start_et)
-    boundary = local.replace(hour=h, minute=m, second=0, microsecond=0)
-    if local < boundary:
-        local = local - timedelta(days=1)
-    return local.date().isoformat()
+def extract_closed_cash(balance: dict[str, Any]) -> tuple[float, datetime]:
+    """Extract confirmed cash balance without silently substituting net liquidation."""
+    for key in ("amount", "totalCashValue", "cashValue"):
+        if balance.get(key) is not None:
+            value = float(balance[key])
+            break
+    else:
+        if balance.get("netLiquidation") is not None:
+            raise StateUnverified("net liquidation present but closed cash balance unavailable")
+        raise StateUnverified("closed cash balance unavailable")
+    ts = None
+    for key in ("timestamp", "updatedAt", "asOf", "createdAt"):
+        if balance.get(key) is not None:
+            ts = parse_timestamp(balance[key])
+            break
+    if ts is None:
+        raise StateUnverified("cash balance timestamp unavailable")
+    return value, ts
 
 
-def _first_number(obj: Any, keys: tuple[str, ...]) -> float | None:
-    if isinstance(obj, dict):
-        for k in keys:
-            v = obj.get(k)
-            if isinstance(v, (int, float)):
-                return float(v)
-            if isinstance(v, dict):
-                # Tradovate/CrossTrade sometimes nests values in balance objects.
-                for vk in ("value", "amount", "balance"):
-                    nv = v.get(vk)
-                    if isinstance(nv, (int, float)):
-                        return float(nv)
-        for v in obj.values():
-            found = _first_number(v, keys)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for v in obj:
-            found = _first_number(v, keys)
-            if found is not None:
-                return found
-    return None
+def ny_date(ts: datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(NY).date().isoformat()
 
 
-def _find_list(obj: Any, keys: tuple[str, ...]) -> list[dict]:
-    if isinstance(obj, dict):
-        for k in keys:
-            v = obj.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        for v in obj.values():
-            found = _find_list(v, keys)
-            if found:
-                return found
-    return []
+def _commission_and_fees(fill: dict[str, Any]) -> float:
+    total = 0.0
+    for key in ("commission", "fees", "fee"):
+        v = fill.get(key)
+        if isinstance(v, (int, float)):
+            total += float(v)
+    return total
 
 
+def realized_by_ny_day(fills: Iterable[dict[str, Any]], *, point_value: float = 2.0,
+                       instrument_root: str = "MNQ") -> dict[str, float]:
+    """FIFO realized P&L by New York calendar date.
 
-def _collect_account_records(snapshot: Any) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    seen: set[int] = set()
-
-    def walk(obj: Any):
-        if isinstance(obj, dict):
-            aid = _record_account_id(obj)
-            name = _record_account_name(obj)
-            if aid is not None and name:
-                # Prefer account-level records, not nested rows.
-                if aid not in seen and (
-                    any(k in obj for k in _NETLIQ_KEYS + _BALANCE_KEYS)
-                    or "positions" in obj or "orders" in obj
-                ):
-                    out.append(obj)
-                    seen.add(aid)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-    walk(snapshot)
+    Exact fail-closed scope: if an executable fill for another instrument is present,
+    its point value is unknown to this MNQ-only Router and the ledger is rejected.
+    Fees/commissions are attributed on their fill timestamp when provided.
+    """
+    rows = sorted(list(fills), key=lambda f: parse_timestamp(f.get("timestamp") or f.get("time")))
+    # lots are signed qty/price; positive long, negative short.
+    lots: deque[list[float]] = deque()
+    out: dict[str, float] = {}
+    seen_exec: set[str] = set()
+    for f in rows:
+        exec_id = str(f.get("executionId") or f.get("fillId") or "")
+        if exec_id and exec_id in seen_exec:
+            continue
+        if exec_id:
+            seen_exec.add(exec_id)
+        root = str(f.get("root") or f.get("instrumentRoot") or f.get("instrument") or "")
+        if root and not root.upper().startswith(instrument_root.upper()):
+            raise StateUnverified(f"non-{instrument_root} fill in account ledger: {root}")
+        ts = parse_timestamp(f.get("timestamp") or f.get("time"))
+        day = ny_date(ts)
+        out.setdefault(day, 0.0)
+        qty = int(float(f.get("qty", 0)))
+        price = float(f.get("price", 0))
+        if qty <= 0 or price <= 0:
+            raise StateUnverified("invalid fill qty/price")
+        action = str(f.get("action", "")).lower()
+        incoming = qty if action in {"buy", "b", "long"} else -qty if action in {"sell", "s", "short"} else 0
+        if incoming == 0:
+            raise StateUnverified("unknown fill action")
+        remaining = incoming
+        while remaining and lots and (lots[0][0] > 0) != (remaining > 0):
+            lot_qty, lot_price = lots[0]
+            close_qty = min(abs(int(lot_qty)), abs(int(remaining)))
+            if lot_qty > 0:  # selling a prior long
+                pnl = (price - lot_price) * point_value * close_qty
+            else:  # buying back a prior short
+                pnl = (lot_price - price) * point_value * close_qty
+            out[day] += pnl
+            lot_sign = 1 if lot_qty > 0 else -1
+            rem_sign = 1 if remaining > 0 else -1
+            lot_qty -= lot_sign * close_qty
+            remaining -= rem_sign * close_qty
+            if abs(lot_qty) < 1e-9:
+                lots.popleft()
+            else:
+                lots[0][0] = lot_qty
+        if remaining:
+            lots.append([float(remaining), price])
+        out[day] -= _commission_and_fees(f)
     return out
 
 
-def _find_account_record(
-    snapshot: Any,
-    account_name: str | None,
-    account_id: int | None = None,
-) -> dict[str, Any] | None:
-    target = (account_name or "").lower()
-
-    def walk(obj: Any) -> dict[str, Any] | None:
-        if isinstance(obj, dict):
-            # Unique numeric ID wins. This avoids ambiguity when display names repeat.
-            if account_id is not None and _record_account_id(obj) == account_id:
-                return obj
-            if account_id is None and target:
-                n = _record_account_name(obj)
-                if n and n.lower() == target:
-                    return obj
-            for v in obj.values():
-                r = walk(v)
-                if r is not None:
-                    return r
-        elif isinstance(obj, list):
-            for v in obj:
-                r = walk(v)
-                if r is not None:
-                    return r
-        return None
-
-    return walk(snapshot)
-
-
-
-def _apply_manual_override(cfg: AccountConfig, override: dict[str, Any] | None) -> AccountConfig:
-    if not override:
-        return cfg
-    allowed = {
-        "firm", "program", "phase", "starting_balance", "max_loss",
-        "profit_target", "max_micros", "drawdown_type", "lock_offset",
-        "consistency_pct", "daily_loss_limit", "risk_profile",
-        "trading_day_start_et", "eod_snapshot_time_et",
-        "rules_verified", "risk_ready",
-        "bootstrap_mll_floor", "bootstrap_peak_eod_balance",
-        "bootstrap_live_high_water",
-    }
-    update = {k: v for k, v in override.items() if k in allowed}
-    update["profile_source"] = "manual_override"
-    merged = cfg.model_dump()
-    merged.update(update)
-    return AccountConfig.model_validate(merged)
-
-
-class AccountStateCache:
-    def __init__(
-        self,
-        accounts: list[AccountConfig],
-        store: Store,
-        *,
-        auto_discovery: bool = True,
-        fundednext_default_model: str = "Legacy",
-    ):
-        self.accounts = {a.id: a for a in accounts}
-        self.store = store
-        self.auto_discovery = auto_discovery
-        self.fundednext_default_model = fundednext_default_model
-        self._state: dict[str, AccountRuntime] = {}
-        self._lock = asyncio.Lock()
-
-    async def snapshot(self) -> dict[str, AccountRuntime]:
-        async with self._lock:
-            return copy.deepcopy(self._state)
-
-    async def configs_snapshot(self) -> list[AccountConfig]:
-        async with self._lock:
-            return copy.deepcopy(list(self.accounts.values()))
-
-    async def update_from_snapshot(self, raw_snapshot: Any):
-        now = datetime.now(timezone.utc)
-        updates: dict[str, AccountRuntime] = {}
-
-        if self.auto_discovery:
-            for rec in _collect_account_records(raw_snapshot):
-                aid = _record_account_id(rec)
-                name = _record_account_name(rec)
-                if aid is None or not name:
-                    continue
-                rid = f"CT_{aid}"
-                effective = _first_number(rec, _BALANCE_KEYS)
-                if effective is None:
-                    effective = _first_number(rec, _NETLIQ_KEYS)
-
-                existing = self.accounts.get(rid)
-                if existing is None or existing.auto_discovered:
-                    cfg = infer_account_config(
-                        account_id=aid,
-                        account_name=name,
-                        effective_balance=effective,
-                        fundednext_default_model=self.fundednext_default_model,
-                    )
-                    override = self.store.get_override(rid)
-                    cfg = _apply_manual_override(cfg, override)
-
-                    # Preserve explicit bootstrap fields from the current in-memory config
-                    # unless the manual override supplied replacements.
-                    if existing is not None:
-                        if cfg.bootstrap_mll_floor is None:
-                            cfg.bootstrap_mll_floor = existing.bootstrap_mll_floor
-                        if cfg.bootstrap_peak_eod_balance is None:
-                            cfg.bootstrap_peak_eod_balance = existing.bootstrap_peak_eod_balance
-                        if cfg.bootstrap_live_high_water is None:
-                            cfg.bootstrap_live_high_water = existing.bootstrap_live_high_water
-
-                    self.accounts[rid] = cfg
-                    self.store.upsert_registry(cfg)
-
-        for a in list(self.accounts.values()):
-            if a.crosstrade_account_id is None and (
-                not a.account_name or a.account_name.startswith("REPLACE_")
-            ):
-                continue
-            rec = _find_account_record(
-                raw_snapshot, a.account_name, a.crosstrade_account_id
-            )
-            if rec is None:
-                continue
-
-            balance = _first_number(rec, _BALANCE_KEYS)
-            net_liq = _first_number(rec, _NETLIQ_KEYS)
-            positions = _find_list(rec, ("positions", "openPositions"))
-            working_orders = _find_list(rec, ("orders", "workingOrders", "activeOrders"))
-            working_orders = [
-                o for o in working_orders
-                if str(o.get("orderStatus", o.get("status", "Working"))).lower()
-                not in {"filled", "cancelled", "canceled", "rejected", "expired"}
-            ]
-
-            runtime = self._apply_prop_state(a, balance, net_liq, positions, working_orders, rec, now)
-            updates[a.id] = runtime
-
-        async with self._lock:
-            self._state.update(updates)
-
-    def _apply_prop_state(
-        self,
-        a: AccountConfig,
-        balance: float | None,
-        net_liq: float | None,
-        positions: list[dict],
-        orders: list[dict],
-        raw: dict,
-        now: datetime,
-    ) -> AccountRuntime:
-        persisted = self.store.get_prop_state(a.id) or {}
-
-        # v0.1 discovery used $1 placeholder profiles. Never carry that bogus
-        # floor into a real auto-classified prop profile.
-        if a.starting_balance >= 25000 and persisted.get("mll_floor") is not None:
-            if float(persisted.get("mll_floor") or 0) <= 1.01:
-                persisted = {}
-
-        initial_floor = a.starting_balance - a.max_loss
-        floor = persisted.get("mll_floor")
-        if floor is None:
-            floor = a.bootstrap_mll_floor if a.bootstrap_mll_floor is not None else initial_floor
-
-        peak_eod = persisted.get("peak_eod_balance")
-        if peak_eod is None:
-            peak_eod = a.bootstrap_peak_eod_balance or a.starting_balance
-
-        live_high = persisted.get("live_high_water")
-        if live_high is None:
-            live_high = a.bootstrap_live_high_water or a.starting_balance
-
-        locked = bool(persisted.get("mll_locked", False))
-
-        effective_balance = balance if balance is not None else net_liq
-        if effective_balance is not None:
-            live_mark = max(effective_balance, net_liq or effective_balance)
-            live_high = max(live_high or live_mark, live_mark)
-
-        # Static is always exact.
-        if a.drawdown_type == DrawdownType.STATIC:
-            floor = initial_floor
-            locked = True
-
-        # Live-trailing rules can update continuously using net-liq/high-water.
-        elif a.drawdown_type in {DrawdownType.LIVE_TRAIL_TO_LOCK, DrawdownType.LIVE_TRAIL_NO_PREPASS_LOCK}:
-            candidate = (live_high or a.starting_balance) - a.max_loss
-            if a.drawdown_type == DrawdownType.LIVE_TRAIL_TO_LOCK:
-                candidate = min(a.lock_level, candidate)
-            floor = max(float(floor), candidate)
-            if a.drawdown_type == DrawdownType.LIVE_TRAIL_TO_LOCK and floor >= a.lock_level - 0.01:
-                floor = a.lock_level
-                locked = True
-
-        # EOD trailing is intentionally advanced only by mark_eod().
-        elif a.drawdown_type in {DrawdownType.EOD_TRAIL_TO_LOCK, DrawdownType.EOD_TRAIL_NO_PREPASS_LOCK}:
-            candidate = (peak_eod or a.starting_balance) - a.max_loss
-            if a.drawdown_type == DrawdownType.EOD_TRAIL_TO_LOCK:
-                candidate = min(a.lock_level, candidate)
-            floor = max(float(floor), candidate)
-            if a.drawdown_type == DrawdownType.EOD_TRAIL_TO_LOCK and floor >= a.lock_level - 0.01:
-                floor = a.lock_level
-                locked = True
-
-        # Track realized P&L on the prop trading day (not calendar midnight).
-        day_key = _trading_day_key(now, a.trading_day_start_et)
-        old_day = persisted.get("day_key")
-        day_start = persisted.get("day_start_balance")
-        largest_day = float(persisted.get("largest_winning_day") or 0.0)
-        if effective_balance is not None:
-            if not old_day:
-                day_start = effective_balance
-                old_day = day_key
-            elif old_day != day_key:
-                if day_start is not None:
-                    largest_day = max(largest_day, effective_balance - float(day_start))
-                day_start = effective_balance
-                old_day = day_key
-
-        self.store.upsert_prop_state(
-            a.id, mll_floor=floor, peak_eod_balance=peak_eod, live_high_water=live_high,
-            mll_locked=locked, day_start_balance=day_start, day_key=old_day,
-            largest_winning_day=largest_day
-        )
-
-        realized_today = 0.0
-        if effective_balance is not None and day_start is not None:
-            realized_today = effective_balance - float(day_start)
-        current_winning_day = max(0.0, realized_today)
-        largest_live = max(largest_day, current_winning_day)
-
-        cushion = None if effective_balance is None else max(0.0, effective_balance - float(floor))
-        return AccountRuntime(
-            account_id=a.id,
-            account_name=_record_account_name(raw) or a.account_name,
-            balance=balance,
-            net_liq=net_liq,
-            mll_floor=float(floor),
-            cushion=cushion,
-            peak_eod_balance=peak_eod,
-            live_high_water=live_high,
-            mll_locked=locked,
-            positions=positions,
-            working_orders=orders,
-            source_updated_at=now,
-            cache_updated_at=now,
-            day_start_balance=day_start,
-            realized_today=realized_today,
-            largest_winning_day=largest_live,
-            trading_day_key=old_day,
-            raw=raw,
-        )
-
-    async def apply_override_now(self, account_id: str):
-        async with self._lock:
-            current = self.accounts.get(account_id)
-            if current is None:
-                raise KeyError(account_id)
-            override = self.store.get_override(account_id)
-            self.accounts[account_id] = _apply_manual_override(current, override)
-            self.store.upsert_registry(self.accounts[account_id])
-
-
-    async def mark_eod(self, account_id: str, eod_balance: float):
-        """Advance an EOD trailing floor from an authoritative completed-EOD balance."""
-        a = self.accounts[account_id]
-        persisted = self.store.get_prop_state(account_id) or {}
-        peak = max(float(persisted.get("peak_eod_balance") or a.starting_balance), eod_balance)
-        floor = float(persisted.get("mll_floor") or (a.starting_balance - a.max_loss))
-        locked = bool(persisted.get("mll_locked", False))
-
-        if a.drawdown_type in {DrawdownType.EOD_TRAIL_TO_LOCK, DrawdownType.EOD_TRAIL_NO_PREPASS_LOCK}:
-            candidate = peak - a.max_loss
-            if a.drawdown_type == DrawdownType.EOD_TRAIL_TO_LOCK:
-                candidate = min(a.lock_level, candidate)
-            floor = max(floor, candidate)
-            if a.drawdown_type == DrawdownType.EOD_TRAIL_TO_LOCK and floor >= a.lock_level - 0.01:
-                floor, locked = a.lock_level, True
-
-        self.store.upsert_prop_state(
-            account_id, peak_eod_balance=peak, mll_floor=floor, mll_locked=locked
-        )
-
-
-    async def auto_mark_eod(self, now_utc: datetime | None = None):
-        """
-        Advance EOD-trailing floors once per configured trading date.
-
-        This runs in the background poller, never inside the webhook critical path.
-        It uses the latest CLOSED balance after each account's configured EOD snapshot time.
-        """
-        now_utc = now_utc or datetime.now(timezone.utc)
-        local = now_utc.astimezone(ET)
-        states = await self.snapshot()
-
-        for a in self.accounts.values():
-            if not a.eod_snapshot_time_et:
-                continue
-            if a.drawdown_type not in {DrawdownType.EOD_TRAIL_TO_LOCK, DrawdownType.EOD_TRAIL_NO_PREPASS_LOCK}:
-                continue
-
-            h, m = _hhmm(a.eod_snapshot_time_et)
-            cutoff = local.replace(hour=h, minute=m, second=0, microsecond=0)
-            if local < cutoff:
-                continue
-
-            # The EOD mark corresponds to the calendar trading date that just closed.
-            mark_date = local.date().isoformat()
-            if self.store.has_eod_mark(a.id, mark_date):
-                continue
-
-            state = states.get(a.id)
-            if state is None:
-                continue
-            bal = state.balance if state.balance is not None else state.net_liq
-            if bal is None:
-                continue
-
-            await self.mark_eod(a.id, float(bal))
-            self.store.record_eod_mark(a.id, mark_date, float(bal))
-
-
-class StatePoller:
-    def __init__(self, client: CrossTradeClient, cache: AccountStateCache, interval: float):
-        self.client = client
-        self.cache = cache
-        self.interval = interval
-        self.task: asyncio.Task | None = None
-        self.last_error: str | None = None
-        self.last_success: datetime | None = None
-
-    async def refresh_once(self):
-        raw = await self.client.get_accounts_snapshot()
-        await self.cache.update_from_snapshot(raw)
-        await self.cache.auto_mark_eod()
-        self.last_success = datetime.now(timezone.utc)
-        self.last_error = None
-
-    async def _loop(self):
-        while True:
-            try:
-                await self.refresh_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_error = repr(exc)
-            await asyncio.sleep(self.interval)
-
-    def start(self):
-        if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._loop(), name="autoprop-state-poller")
-
-    async def stop(self):
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
+def current_ny_realized(fills: Iterable[dict[str, Any]], now: datetime | None = None) -> float:
+    now = now or datetime.now(timezone.utc)
+    return realized_by_ny_day(fills).get(ny_date(now), 0.0)

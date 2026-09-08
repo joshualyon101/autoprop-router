@@ -1,205 +1,149 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
+from datetime import datetime
+from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
-import hashlib
-import json
+
+AccountType = Literal["challenge", "funded", "personal"]
+Profile = Literal["standard", "aggressive"]
+Drawdown = Literal["static", "eod", "live"]
+Side = Literal["LONG", "SHORT"]
 
 
-class AccountPhase(str, Enum):
-    CHALLENGE = "challenge"
-    FUNDED = "funded"
-    PERSONAL = "personal"
-
-
-class DrawdownType(str, Enum):
-    STATIC = "static"
-    EOD_TRAIL_TO_LOCK = "eod_trail_to_lock"
-    LIVE_TRAIL_TO_LOCK = "live_trail_to_lock"
-    EOD_TRAIL_NO_PREPASS_LOCK = "eod_trail_no_prepass_lock"
-    LIVE_TRAIL_NO_PREPASS_LOCK = "live_trail_no_prepass_lock"
-
-
-class RiskProfile(str, Enum):
-    STANDARD = "Standard"
-    AGGRESSIVE = "Aggressive"
-
-
-class AccountConfig(BaseModel):
-    id: str
-    crosstrade_account_id: int | None = None
-    account_name: str
-    firm: str
-    program: str
-    phase: AccountPhase
-    starting_balance: float = Field(gt=0)
-    max_loss: float = Field(ge=0)
-    profit_target: float = Field(default=0, ge=0)
-    max_micros: int = Field(gt=0, le=500)
-    drawdown_type: DrawdownType
-    lock_offset: float = 0.0
-    consistency_pct: float | None = Field(default=None, gt=0, le=100)
-    daily_loss_limit: float | None = Field(default=None, gt=0)
-    risk_profile: RiskProfile = RiskProfile.STANDARD
-    trading_day_start_et: str = "18:00"
-    eod_snapshot_time_et: str | None = "18:05"
+class AccountRule(BaseModel):
+    account_id: str
+    crosstrade_account: str
     enabled: bool = False
     rules_verified: bool = False
-    bootstrap_mll_floor: float | None = None
-    bootstrap_peak_eod_balance: float | None = None
-    bootstrap_live_high_water: float | None = None
-    auto_discovered: bool = False
-    profile_source: str = "static"
-    risk_ready: bool = False
-
-    @property
-    def lock_level(self) -> float:
-        return self.starting_balance + self.lock_offset
-
-
-class AccountRuntime(BaseModel):
-    account_id: str
-    account_name: str
-    balance: float | None = None
-    net_liq: float | None = None
-    mll_floor: float | None = None
-    cushion: float | None = None
-    peak_eod_balance: float | None = None
-    live_high_water: float | None = None
-    mll_locked: bool = False
-    positions: list[dict[str, Any]] = Field(default_factory=list)
-    working_orders: list[dict[str, Any]] = Field(default_factory=list)
-    source_updated_at: datetime | None = None
-    cache_updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    day_start_balance: float | None = None
-    realized_today: float = 0.0
-    largest_winning_day: float = 0.0
-    trading_day_key: str | None = None
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-    @property
-    def is_flat(self) -> bool:
-        for p in self.positions:
-            qty = p.get("quantity", p.get("qty", p.get("netPos", 0)))
-            try:
-                if abs(float(qty or 0)) > 0:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
-
-    @property
-    def has_working_orders(self) -> bool:
-        return len(self.working_orders) > 0
-
-
-class SignalEvent(str, Enum):
-    ENTRY = "ENTRY"
-    PARTIAL_EXIT = "PARTIAL_EXIT"
-    EXIT = "EXIT"
-    FLATTEN = "FLATTEN"
-    STOP_MOVE = "STOP_MOVE"
-
-
-class TradeSignal(BaseModel):
-    # event_id is the preferred idempotency key. trade_id links the lifecycle.
-    event_id: str | None = Field(default=None, max_length=160)
-    trade_id: str = Field(min_length=3, max_length=160)
-    event: SignalEvent
-    engine: str = Field(min_length=1, max_length=64)
-    direction: str | None = None
-    instrument: str = "MNQ1!"
-    execution_symbol: str | None = None
-
-    entry: float | None = None
-    stop: float | None = None
-    tp1: float | None = None
-    tp2: float | None = None
-    contract_risk_dollars: float | None = Field(default=None, gt=0)
-
-    # Source strategy quantities let the Router preserve TP1/runner proportions
-    # after per-account dynamic sizing.
-    source_qty: int | None = Field(default=None, ge=1, le=500)
-    tp1_qty: int | None = Field(default=None, ge=0, le=500)
-    runner_qty: int | None = Field(default=None, ge=0, le=500)
-    exit_qty: int | None = Field(default=None, ge=1, le=500)
-    exit_reason: str | None = Field(default=None, max_length=80)
-
-    note: str | None = None
-    emitted_at_ms: int | None = None
-    min_runner_qty: int = Field(default=2, ge=1, le=100)
-    breakeven_after_tp1: bool = False
-    breakeven_offset_ticks: int = Field(default=0, ge=0, le=100)
+    account_type: AccountType
+    profile: Profile = "standard"
+    starting_balance: float = Field(gt=0)
+    max_loss: float = Field(ge=0)
+    max_contracts: int = Field(gt=0)
+    drawdown: Drawdown = "eod"
+    challenge_target: float = Field(default=0, ge=0)
+    challenge_consistency_enabled: bool = False
+    challenge_consistency_pct: float = Field(default=40.0, gt=0, le=100)
+    funded_consistency_enabled: bool = False
+    funded_daily_profit_cap: float = Field(default=0, ge=0)
+    personal_risk_method: Literal["percent", "fixed"] = "fixed"
+    personal_risk_value: float = Field(default=250.0, ge=0)
+    notes: str = ""
 
     @model_validator(mode="after")
-    def validate_signal(self):
-        if self.direction:
-            d = self.direction.upper()
-            if d not in {"LONG", "SHORT", "BUY", "SELL"}:
-                raise ValueError("direction must be LONG/SHORT/BUY/SELL")
-            self.direction = d
-        if self.event == SignalEvent.ENTRY:
-            if not self.direction:
-                raise ValueError("direction is required for ENTRY")
-            if self.contract_risk_dollars is None and (self.entry is None or self.stop is None):
-                raise ValueError("ENTRY requires contract_risk_dollars, or both entry and stop")
-            if self.stop is None:
-                raise ValueError("ENTRY requires a protective stop for production routing")
-        if self.event == SignalEvent.STOP_MOVE and self.stop is None:
-            raise ValueError("STOP_MOVE requires stop")
+    def required_prop_fields(self):
+        if self.account_type in {"challenge", "funded"} and self.max_loss <= 0:
+            raise ValueError("prop account requires max_loss")
+        if self.account_type == "challenge" and self.challenge_target <= 0:
+            raise ValueError("challenge requires challenge_target")
         return self
 
-    def dedupe_key(self) -> str:
-        if self.event_id:
-            return self.event_id
-        # Stable fingerprint: repeated webhook retries of the same event dedupe,
-        # while later events using the same trade_id are allowed.
-        payload = {
-            "trade_id": self.trade_id,
-            "event": self.event.value,
-            "engine": self.engine,
-            "direction": self.direction,
-            "instrument": self.instrument,
-            "entry": self.entry,
-            "stop": self.stop,
-            "tp1": self.tp1,
-            "tp2": self.tp2,
-            "source_qty": self.source_qty,
-            "tp1_qty": self.tp1_qty,
-            "runner_qty": self.runner_qty,
-            "exit_qty": self.exit_qty,
-            "exit_reason": self.exit_reason,
-            "emitted_at_ms": self.emitted_at_ms,
-        }
-        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return "APEV-" + hashlib.sha256(raw.encode()).hexdigest()[:40]
 
-
-class RouteDecision(BaseModel):
+class AccountState(BaseModel):
     account_id: str
-    account_name: str
-    eligible: bool
-    reason: str
-    quantity: int = 0
-    risk_budget: float = 0.0
-    contract_risk: float = 0.0
-    cushion: float | None = None
-    mll_floor: float | None = None
-    cache_age_ms: float | None = None
-    routed_tp1: float | None = None
-    routed_tp2: float | None = None
-    routed_tp1_qty: int = 0
-    routed_runner_qty: int = 0
-    consistency_room: float | None = None
-    execution_result: dict[str, Any] | None = None
+    closed_cash_balance: float
+    mll_floor: Optional[float] = None
+    mll_verified: bool = False
+    funded_locked: bool = False
+    realized_today: float = 0.0
+    largest_winning_day: float = 0.0
+    state_timestamp: datetime
+    daily_ledger_verified: bool = False
+    source: str = "broker"
 
 
-class RouteResponse(BaseModel):
-    trade_id: str
-    event: str
-    mode: str
-    management_mode: str
-    router_processing_ms: float
-    decisions: list[RouteDecision]
+class VerifiedRiskState(BaseModel):
+    """Separately verified prop-state facts that cash balance alone cannot prove."""
+    account_id: str
+    mll_floor: Optional[float] = None
+    mll_verified: bool = False
+    funded_locked: bool = False
+    largest_winning_day: float = 0.0
+    ledger_verified: bool = False
+    cycle_start_utc: Optional[datetime] = None
+    verified_at: datetime
+    source: str = "manual_or_external_verified"
+
+
+class CanonicalPlan(BaseModel):
+    event_id: str
+    engine: Literal["ORG", "SILVER", "CORE", "TGIF", "DWC"]
+    side: Side
+    entry: float
+    stop: float
+    tp1: float
+    tp2: Optional[float] = None
+    module: str = ""
+    source: str = ""
+    score: int = 0
+    reentry: bool = False
+    reentry_type: str = ""
+    native_time_ms: Optional[int] = None
+    native_bar_index: Optional[int] = None
+    source_qty: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_geometry(self):
+        if self.engine == "CORE" and self.tp2 is None:
+            raise ValueError("Core requires tp2")
+        if self.side == "LONG" and not self.stop < self.entry:
+            raise ValueError("long stop must be below entry")
+        if self.side == "SHORT" and not self.stop > self.entry:
+            raise ValueError("short stop must be above entry")
+        return self
+
+
+class Allocation(BaseModel):
+    account_id: str
+    event_id: str
+    engine: str
+    side: Side
+    qty: int
+    entry: float
+    stop: float
+    tp1: float
+    tp2: Optional[float] = None
+    tp1_qty: int
+    runner_qty: int
+    base_risk: float
+    effective_risk_budget: float
+    risk_per_contract: float
+    skip_reason: str = ""
+
+
+class MarketPulse(BaseModel):
+    native_time_ms: int
+    native_close_time_ms: int
+    native_bar_index: int
+    open: float
+    high: float
+    low: float
+    close: float
+    atr: float
+    runner_trail_low: Optional[float] = None
+    runner_trail_high: Optional[float] = None
+
+
+class ActiveTrade(BaseModel):
+    account_id: str
+    event_id: str
+    engine: str
+    side: Side
+    entry: float
+    initial_stop: float
+    current_stop: float
+    tp1: float
+    tp2: Optional[float] = None
+    total_qty: int
+    tp1_qty: int
+    runner_qty: int
+    current_position_qty: int
+    previous_position_qty: int
+    entry_native_bar_index: Optional[int] = None
+    stop_stage: int = 0
+    tp1_filled: bool = False
+    stop_order_ids: list[str] = []
+    target_order_ids: list[str] = []
+    parent_order_id: Optional[str] = None
+    custom_order_id: Optional[str] = None
+    org_attempt_key: Optional[str] = None
