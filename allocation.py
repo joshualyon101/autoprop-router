@@ -17,6 +17,30 @@ class AllocationBlocked(RuntimeError):
     pass
 
 
+def personal_eod_risk_basis(rule: AccountRule, state: AccountState) -> float:
+    """Return the completed New York EOD balance used for Personal percent sizing.
+
+    closed_cash_balance is the current confirmed cash balance. realized_today is the
+    Router's verified New York-calendar-day realized P&L (including reported fees).
+    Subtracting today's realized P&L freezes the risk basis at the prior completed EOD
+    instead of resizing after each intraday winner/loss.
+
+    virtual_eod applies the same cumulative realized account change to a configured
+    reference starting balance. Deposits/withdrawals are cash flows, not trading P&L,
+    so the broker anchor must be updated when external cash is added/removed.
+    """
+    actual_eod = state.closed_cash_balance - state.realized_today
+    if rule.personal_balance_mode == "virtual_eod":
+        basis = rule.personal_virtual_start_balance + (
+            actual_eod - rule.personal_broker_anchor_balance
+        )
+    else:
+        basis = actual_eod
+    if basis <= 0:
+        raise AllocationBlocked("personal EOD risk basis <= 0")
+    return basis
+
+
 def _state_fresh(state: AccountState, max_age_seconds: float, now: datetime | None = None) -> bool:
     now = now or datetime.now(timezone.utc)
     ts = state.state_timestamp
@@ -57,7 +81,7 @@ def _base_risk(rule: AccountRule, state: AccountState) -> tuple[float, float, fl
         return base, cushion, rule.funded_daily_profit_cap, consistency, 1.0
 
     if rule.personal_risk_method == "percent":
-        base = rule.starting_balance * rule.personal_risk_value / 100.0
+        base = personal_eod_risk_basis(rule, state) * rule.personal_risk_value / 100.0
     else:
         base = rule.personal_risk_value
     if rule.profile == "aggressive":

@@ -1,0 +1,18 @@
+{
+  "account_id": "PERSONAL_TRADOVATE",
+  "crosstrade_account": "<EXACT_CROSSTRADE_LIVE_ACCOUNT_NAME>",
+  "enabled": false,
+  "rules_verified": true,
+  "account_type": "personal",
+  "profile": "standard",
+  "starting_balance": 20000.0,
+  "max_loss": 0.0,
+  "max_contracts": 20,
+  "drawdown": "eod",
+  "personal_risk_method": "percent",
+  "personal_risk_value": 0.75,
+  "personal_balance_mode": "virtual_eod",
+  "personal_virtual_start_balance": 20000.0,
+  "personal_broker_anchor_balance": 12000.0,
+  "notes": "Set broker anchor to the exact confirmed EOD cash balance at activation; keep disabled until discovery/readiness are clean."
+}

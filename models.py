@@ -28,6 +28,12 @@ class AccountRule(BaseModel):
     funded_daily_profit_cap: float = Field(default=0, ge=0)
     personal_risk_method: Literal["percent", "fixed"] = "fixed"
     personal_risk_value: float = Field(default=250.0, ge=0)
+    # Personal percent-risk basis. Existing configs default to actual broker EOD cash.
+    # virtual_eod lets a deliberately smaller funded broker balance track a separate
+    # reference account while preserving the same cumulative realized P&L.
+    personal_balance_mode: Literal["actual_eod", "virtual_eod"] = "actual_eod"
+    personal_virtual_start_balance: float = Field(default=0.0, ge=0)
+    personal_broker_anchor_balance: float = Field(default=0.0, ge=0)
     notes: str = ""
 
     @model_validator(mode="after")
@@ -36,6 +42,14 @@ class AccountRule(BaseModel):
             raise ValueError("prop account requires max_loss")
         if self.account_type == "challenge" and self.challenge_target <= 0:
             raise ValueError("challenge requires challenge_target")
+        if self.account_type == "personal" and self.personal_risk_method == "percent":
+            if self.personal_risk_value <= 0:
+                raise ValueError("personal percent risk requires personal_risk_value > 0")
+            if self.personal_balance_mode == "virtual_eod":
+                if self.personal_virtual_start_balance <= 0:
+                    raise ValueError("virtual_eod requires personal_virtual_start_balance > 0")
+                if self.personal_broker_anchor_balance <= 0:
+                    raise ValueError("virtual_eod requires personal_broker_anchor_balance > 0")
         return self
 
 
