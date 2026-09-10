@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -18,14 +19,65 @@ from readiness import readiness
 from settings import Settings
 from state import StateUnverified, ny_date
 from store import Store
+from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 
 settings = Settings()
 store = Store(settings.SQLITE_PATH)
 app = FastAPI(title='AutoProp Router', version=__version__)
+logger = logging.getLogger('autoprop.router')
 
 _worker_task: asyncio.Task | None = None
 _worker_wakeup: asyncio.Event | None = None
 
+
+
+
+def _annotate_execution_result(result):
+    """Add execution outcome telemetry without changing durable worker retry semantics.
+
+    webhook_inbox.status remains DONE when processing completed. Broker/account execution
+    outcome is reported separately so a terminal all-destination failure cannot look healthy.
+    """
+    if not isinstance(result, dict) or result.get('kind') != 'ENTRY':
+        return result
+    rows = result.get('results')
+    if not isinstance(rows, list):
+        return result
+    routed = sum(1 for r in rows if isinstance(r, dict) and r.get('status') == 'ROUTED')
+    errors = []
+    skipped = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        status = str(r.get('status') or '')
+        reason = str(r.get('reason') or '')
+        # ERROR is the RC6 symbol-hotfix contract.  The HTTP prefix also recognizes
+        # already-stored RC6 incidents such as the 2026-09-10 bare-MNQ HTTP 400.
+        if status == 'ERROR' or (status == 'SKIP' and reason.startswith('HTTP ')):
+            errors.append(reason)
+        elif status == 'SKIP':
+            skipped += 1
+    total = len([r for r in rows if isinstance(r, dict)])
+    if routed > 0 and not errors:
+        outcome = 'ROUTED'
+    elif routed > 0:
+        outcome = 'PARTIAL_DESTINATION_FAILURE'
+    elif errors and len(errors) == total:
+        outcome = 'ALL_DESTINATIONS_FAILED'
+    elif errors:
+        outcome = 'NO_ROUTES_WITH_EXECUTION_FAILURES'
+    else:
+        outcome = 'NO_DESTINATIONS_ELIGIBLE'
+    out = dict(result)
+    summary = {'outcome': outcome, 'total': total, 'routed': routed,
+               'execution_errors': len(errors), 'skipped': skipped}
+    global_error = str(result.get('global_execution_error') or '')
+    if global_error:
+        summary['common_error'] = global_error
+    elif errors and len(set(errors)) == 1:
+        summary['common_error'] = errors[0]
+    out['execution_summary'] = summary
+    return out
 
 async def _process_event(event):
     rt = _runtime()
@@ -66,13 +118,25 @@ async def _webhook_worker():
                 raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
             if not base['configuration_ready']:
                 raise RuntimeError(f"router configuration not ready: {base['problems']}")
-            result = await _process_event(event)
+            result = _annotate_execution_result(await _process_event(event))
             store.complete_webhook(key, result)
+            summary = result.get('execution_summary') if isinstance(result, dict) else None
+            if isinstance(summary, dict):
+                outcome = str(summary.get('outcome') or '')
+                log_args = (event.kind, getattr(event, 'engine', ''), outcome,
+                            summary.get('routed'), summary.get('execution_errors'), summary.get('skipped'))
+                if outcome in {'ALL_DESTINATIONS_FAILED', 'NO_ROUTES_WITH_EXECUTION_FAILURES'}:
+                    logger.error('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
+                elif outcome == 'PARTIAL_DESTINATION_FAILURE':
+                    logger.warning('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
+                else:
+                    logger.info('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
         except asyncio.CancelledError:
             # Leave PROCESSING durable; startup recovery will requeue it.
             raise
         except Exception as exc:
             store.fail_webhook(key, str(exc))
+            logger.exception('AutoProp webhook worker failed event_key=%s kind=%s', key, row.get('kind'))
         finally:
             try:
                 store.prune_dedupe(settings.DEDUPE_RETENTION_DAYS)
@@ -137,11 +201,16 @@ def _linked_account_names(payload):
 def health():
     accounts = _accounts()
     base = readiness(settings, accounts)
+    try:
+        execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL)
+    except InstrumentContractError:
+        execution_symbol = 'INVALID'
     return {
         'ok': True,
         'version': __version__,
         'execution_mode': settings.AUTOPROP_EXECUTION_MODE,
         'management_mode': settings.AUTOPROP_MANAGEMENT_MODE,
+        'execution_symbol': execution_symbol,
         'tradingview_alert_contract_verified': settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED,
         'configuration_ready': base['configuration_ready'],
         'broker_mutation_armed': base['broker_mutation_armed'],
@@ -325,6 +394,9 @@ def webhook_inbox(token: str, limit: int = 50):
     for row in rows:
         status = str(row.get('status') or '')
         counts[status] = counts.get(status, 0) + 1
+        # Backfill the execution summary at read time for older DONE rows too.
+        if isinstance(row.get('result'), dict):
+            row['result'] = _annotate_execution_result(row['result'])
     return {'version': __version__, 'counts': counts, 'events': rows}
 
 

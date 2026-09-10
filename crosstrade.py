@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,31 @@ class AmbiguousMutation(CrossTradeError):
 
 class RateLimitExceeded(CrossTradeError):
     """CrossTrade explicitly rejected a request because the per-user rate limit was hit."""
+
+
+class InstrumentContractError(CrossTradeError):
+    """Broker execution symbol is invalid/untranslatable for the MNQ-only AutoProp route."""
+
+
+_MNQ_DATED_RE = re.compile(r"^MNQ[FGHJKMNQUVXZ]\d{1,2}$")
+
+
+def normalize_tradovate_symbol(instrument: str) -> str:
+    """Return a CrossTrade/Tradovate-routable MNQ symbol and fail closed otherwise.
+
+    AutoProp is an MNQ-only system.  The canonical strategy/root identity may be ``MNQ``
+    while CrossTrade requires a resolvable futures contract.  ``MNQ1!`` delegates front-
+    month resolution to CrossTrade and is therefore the default production transport form.
+    Explicit dated Tradovate MNQ contracts remain valid for diagnostics/migrations.
+    """
+    raw = str(instrument or "").strip().upper()
+    if raw in {"MNQ", "MNQ1!"}:
+        return "MNQ1!"
+    if _MNQ_DATED_RE.fullmatch(raw):
+        return raw
+    raise InstrumentContractError(
+        f"unsupported AutoProp execution instrument {instrument!r}; expected MNQ/MNQ1! or dated MNQ contract"
+    )
 
 
 # CrossTrade currently documents/enforces 180 requests/minute per user.  Keep a
@@ -141,7 +167,11 @@ class CrossTradeClient:
             if r.status_code >= 500 and method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                 raise AmbiguousMutation(f"HTTP {r.status_code}")
             if r.status_code >= 400:
-                raise CrossTradeError(f"HTTP {r.status_code}: {r.text[:300]}")
+                body = r.text[:300]
+                lower = body.lower()
+                if "cannot translate" in lower and "tradovate symbol" in lower:
+                    raise InstrumentContractError(f"HTTP {r.status_code}: {body}")
+                raise CrossTradeError(f"HTTP {r.status_code}: {body}")
             return r.json() if r.content else {}
 
     async def list_accounts(self) -> dict[str, Any]:
@@ -154,7 +184,8 @@ class CrossTradeClient:
         return await self._request("GET", f"/v1/api/tv/accounts/{account}/positions")
 
     async def position(self, account: str, instrument: str = "MNQ1!") -> dict[str, Any]:
-        return await self._request("GET", f"/v1/api/tv/accounts/{account}/position", params={"instrument": instrument})
+        symbol = normalize_tradovate_symbol(instrument)
+        return await self._request("GET", f"/v1/api/tv/accounts/{account}/position", params={"instrument": symbol})
 
     async def orders(self, account: str) -> dict[str, Any]:
         # Account-scoped working orders.
@@ -176,11 +207,16 @@ class CrossTradeClient:
         return await self._request("GET", "/v1/api/tv/fills/history", params=params)
 
     async def place(self, account: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=payload)
+        if "instrument" not in payload:
+            raise InstrumentContractError("CrossTrade PLACE payload missing instrument")
+        normalized = dict(payload)
+        normalized["instrument"] = normalize_tradovate_symbol(normalized["instrument"])
+        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=normalized)
 
     async def change(self, account: str, order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("PUT", f"/v1/api/tv/accounts/{account}/orders/{order_id}/change", json=payload)
 
-    async def flatten(self, account: str, instrument: str = "MNQ") -> dict[str, Any]:
+    async def flatten(self, account: str, instrument: str = "MNQ1!") -> dict[str, Any]:
+        symbol = normalize_tradovate_symbol(instrument)
         return await self._request("POST", f"/v1/api/tv/accounts/{account}/positions/flatten",
-                                   json={"instrument": instrument})
+                                   json={"instrument": symbol})

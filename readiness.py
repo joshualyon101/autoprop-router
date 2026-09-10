@@ -1,6 +1,7 @@
 from __future__ import annotations
 from models import AccountRule
 from settings import Settings
+from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 
 
 def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:
@@ -12,6 +13,10 @@ def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:
         problems.append('native ATM breakeven must be disabled')
     if settings.LIVE_MAX_QTY_PER_ACCOUNT != 0:
         problems.append('LIVE_MAX_QTY_PER_ACCOUNT must be 0 for formula parity')
+    try:
+        normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL)
+    except InstrumentContractError as exc:
+        problems.append(f'execution symbol invalid: {exc}')
     if settings.AUTOPROP_LIVE_ARM != 'I_UNDERSTAND_LIVE_ORDERS':
         problems.append('live arm missing')
     if settings.AUTOPROP_FULL_SCALE_ARM != 'I_UNDERSTAND_FULL_SCALE':

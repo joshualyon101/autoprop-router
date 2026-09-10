@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from allocation import allocate, AllocationBlocked
-from crosstrade import CrossTradeClient, CrossTradeError
+from crosstrade import CrossTradeClient, CrossTradeError, InstrumentContractError, normalize_tradovate_symbol
 from events import ParsedEvent
 from execution import Executor, ProtectionFailure
 from management import core_on_market_pulse, silver_lock_stop
@@ -46,7 +46,9 @@ class LiveRouter:
             settings.CROSSTRADE_RATE_LIMIT_MAX_RETRIES,
             settings.CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS,
         )
+        self.execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL or 'MNQ1!')
         self.executor = Executor(self.client,
+                                 execution_symbol=self.execution_symbol,
                                  bracket_confirm_retries=settings.BRACKET_CONFIRM_RETRIES,
                                  bracket_confirm_delay=settings.BRACKET_CONFIRM_RETRY_DELAY_SECONDS,
                                  change_retries=settings.MANAGEMENT_CHANGE_RETRIES,
@@ -54,7 +56,7 @@ class LiveRouter:
 
     async def position_qty(self, rule: AccountRule) -> int:
         payload = await self.client.position(rule.crosstrade_account,
-                                             self.settings.DEFAULT_EXECUTION_SYMBOL or 'MNQ1!')
+                                             self.execution_symbol)
         data = payload.get('data', payload)
         if not isinstance(data, dict) or data.get('netPos') is None:
             raise StateUnverified('fill-reconciled position response missing netPos')
@@ -114,9 +116,14 @@ class LiveRouter:
             raise ValueError('ENTRY missing canonical plan')
         now = datetime.now(timezone.utc)
         results = []
+        global_instrument_error: str | None = None
         for rule in self.accounts:
             if not rule.enabled:
                 results.append({'account_id': rule.account_id, 'status': 'SKIP', 'reason': 'disabled'})
+                continue
+            if global_instrument_error is not None:
+                results.append({'account_id': rule.account_id, 'status': 'ERROR',
+                                'reason': 'global instrument contract failure; fanout aborted before broker mutation: ' + global_instrument_error})
                 continue
             try:
                 await self.entry_gate(rule)
@@ -143,22 +150,22 @@ class LiveRouter:
                 target_ids, stop_ids = await self.executor.owned_roles(rule.crosstrade_account,
                                                                         receipt.child_order_ids)
                 if not stop_ids:
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure('accepted entry has no proven owned protective stop')
                 try:
                     actual_entry = await self.entry_fill_price(receipt.parent_order_id, alloc.qty)
                 except (CrossTradeError, ProtectionFailure, ValueError) as exc:
                     # An accepted broker position may already exist. Never manage it from the
                     # canonical/planned Pine entry when the destination fill cannot be proven.
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure(f'destination fill proof failed; flattened: {exc}') from exc
                 signed = await self.position_qty(rule)
                 if signed == 0 or (alloc.side == 'LONG' and signed < 0) or (alloc.side == 'SHORT' and signed > 0):
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure(f'post-entry position mismatch netPos={signed}')
                 pos_qty = abs(signed)
                 if pos_qty != alloc.qty:
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure(f'post-entry position qty {pos_qty} != routed qty {alloc.qty}')
                 trade = ActiveTrade(account_id=rule.account_id, event_id=event.plan.event_id,
                                     engine=alloc.engine, side=alloc.side, entry=actual_entry,
@@ -181,9 +188,20 @@ class LiveRouter:
                                 'qty': alloc.qty, 'tp1_qty': alloc.tp1_qty,
                                 'runner_qty': alloc.runner_qty, 'stop': alloc.stop,
                                 'tp1': alloc.tp1, 'tp2': alloc.tp2})
-            except (AllocationBlocked, StateUnverified, CrossTradeError, ProtectionFailure, ValueError) as exc:
+            except InstrumentContractError as exc:
+                # A symbol translation/contract failure is global to this AutoProp MNQ fanout.
+                # Stop after the first definitive failure rather than repeating the same bad
+                # broker mutation across every account.  Do not retry the entry automatically.
+                global_instrument_error = str(exc)
+                results.append({'account_id': rule.account_id, 'status': 'ERROR', 'reason': global_instrument_error})
+            except (CrossTradeError, ProtectionFailure, ValueError) as exc:
+                results.append({'account_id': rule.account_id, 'status': 'ERROR', 'reason': str(exc)})
+            except (AllocationBlocked, StateUnverified) as exc:
                 results.append({'account_id': rule.account_id, 'status': 'SKIP', 'reason': str(exc)})
-        return {'kind': 'ENTRY', 'engine': event.plan.engine, 'results': results}
+        out = {'kind': 'ENTRY', 'engine': event.plan.engine, 'results': results}
+        if global_instrument_error is not None:
+            out['global_execution_error'] = global_instrument_error
+        return out
 
     async def _change_trade_stop(self, rule: AccountRule, trade: ActiveTrade, new_stop: float) -> None:
         signed = await self.position_qty(rule)
@@ -192,7 +210,7 @@ class LiveRouter:
             return
         expected_sign = 1 if trade.side == 'LONG' else -1
         if (signed > 0) != (expected_sign > 0):
-            await self.client.flatten(rule.crosstrade_account, 'MNQ')
+            await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
             self.store.delete_trade(rule.account_id)
             raise ProtectionFailure('position side mismatch during management; flattened')
         qty = abs(signed)
@@ -223,7 +241,7 @@ class LiveRouter:
                     results.append({'account_id': rule.account_id, 'status': 'CLOSED'})
                     continue
                 if (trade.side == 'LONG' and signed < 0) or (trade.side == 'SHORT' and signed > 0):
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     self.store.delete_trade(rule.account_id)
                     results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': 'side mismatch'})
                     continue
@@ -253,7 +271,7 @@ class LiveRouter:
                                     'position_qty': trade.current_position_qty})
             except (CrossTradeError, StateUnverified, ProtectionFailure) as exc:
                 try:
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                 finally:
                     self.store.delete_trade(rule.account_id)
                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': str(exc)})
@@ -291,7 +309,7 @@ class LiveRouter:
                                 'stop': decision.new_stop, 'reason': decision.reason})
             except (CrossTradeError, StateUnverified, ProtectionFailure) as exc:
                 try:
-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                 finally:
                     self.store.delete_trade(rule.account_id)
                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': str(exc)})
@@ -309,7 +327,7 @@ class LiveRouter:
             if event.engine not in {'', 'GLOBAL', 'ACCOUNT'} and trade is None:
                 continue
             try:
-                await self.client.flatten(rule.crosstrade_account, 'MNQ')
+                await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                 self.store.delete_trade(rule.account_id)
                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED'})
             except CrossTradeError as exc:

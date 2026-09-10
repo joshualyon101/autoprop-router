@@ -1,0 +1,763 @@
+--- autoprop_rc6_work/autoprop-router-main/crosstrade.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/crosstrade.py	2026-09-10 21:19:17.244285220 +0000
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import time
++import re
+ from collections import deque
+ from dataclasses import dataclass
+ from typing import Any
+@@ -21,6 +22,31 @@
+     """CrossTrade explicitly rejected a request because the per-user rate limit was hit."""
+ 
+ 
++class InstrumentContractError(CrossTradeError):
++    """Broker execution symbol is invalid/untranslatable for the MNQ-only AutoProp route."""
++
++
++_MNQ_DATED_RE = re.compile(r"^MNQ[FGHJKMNQUVXZ]\d{1,2}$")
++
++
++def normalize_tradovate_symbol(instrument: str) -> str:
++    """Return a CrossTrade/Tradovate-routable MNQ symbol and fail closed otherwise.
++
++    AutoProp is an MNQ-only system.  The canonical strategy/root identity may be ``MNQ``
++    while CrossTrade requires a resolvable futures contract.  ``MNQ1!`` delegates front-
++    month resolution to CrossTrade and is therefore the default production transport form.
++    Explicit dated Tradovate MNQ contracts remain valid for diagnostics/migrations.
++    """
++    raw = str(instrument or "").strip().upper()
++    if raw in {"MNQ", "MNQ1!"}:
++        return "MNQ1!"
++    if _MNQ_DATED_RE.fullmatch(raw):
++        return raw
++    raise InstrumentContractError(
++        f"unsupported AutoProp execution instrument {instrument!r}; expected MNQ/MNQ1! or dated MNQ contract"
++    )
++
++
+ # CrossTrade currently documents/enforces 180 requests/minute per user.  Keep a
+ # process-wide rolling budget below that ceiling so independently-created LiveRouter
+ # clients cannot stampede the same CrossTrade user.  This limiter deliberately allows
+@@ -141,7 +167,11 @@
+             if r.status_code >= 500 and method_u in {"POST", "PUT", "PATCH", "DELETE"}:
+                 raise AmbiguousMutation(f"HTTP {r.status_code}")
+             if r.status_code >= 400:
+-                raise CrossTradeError(f"HTTP {r.status_code}: {r.text[:300]}")
++                body = r.text[:300]
++                lower = body.lower()
++                if "cannot translate" in lower and "tradovate symbol" in lower:
++                    raise InstrumentContractError(f"HTTP {r.status_code}: {body}")
++                raise CrossTradeError(f"HTTP {r.status_code}: {body}")
+             return r.json() if r.content else {}
+ 
+     async def list_accounts(self) -> dict[str, Any]:
+@@ -154,7 +184,8 @@
+         return await self._request("GET", f"/v1/api/tv/accounts/{account}/positions")
+ 
+     async def position(self, account: str, instrument: str = "MNQ1!") -> dict[str, Any]:
+-        return await self._request("GET", f"/v1/api/tv/accounts/{account}/position", params={"instrument": instrument})
++        symbol = normalize_tradovate_symbol(instrument)
++        return await self._request("GET", f"/v1/api/tv/accounts/{account}/position", params={"instrument": symbol})
+ 
+     async def orders(self, account: str) -> dict[str, Any]:
+         # Account-scoped working orders.
+@@ -176,11 +207,16 @@
+         return await self._request("GET", "/v1/api/tv/fills/history", params=params)
+ 
+     async def place(self, account: str, payload: dict[str, Any]) -> dict[str, Any]:
+-        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=payload)
++        if "instrument" not in payload:
++            raise InstrumentContractError("CrossTrade PLACE payload missing instrument")
++        normalized = dict(payload)
++        normalized["instrument"] = normalize_tradovate_symbol(normalized["instrument"])
++        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=normalized)
+ 
+     async def change(self, account: str, order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+         return await self._request("PUT", f"/v1/api/tv/accounts/{account}/orders/{order_id}/change", json=payload)
+ 
+-    async def flatten(self, account: str, instrument: str = "MNQ") -> dict[str, Any]:
++    async def flatten(self, account: str, instrument: str = "MNQ1!") -> dict[str, Any]:
++        symbol = normalize_tradovate_symbol(instrument)
+         return await self._request("POST", f"/v1/api/tv/accounts/{account}/positions/flatten",
+-                                   json={"instrument": instrument})
++                                   json={"instrument": symbol})
+--- autoprop_rc6_work/autoprop-router-main/execution.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/execution.py	2026-09-10 21:19:17.244479848 +0000
+@@ -4,7 +4,7 @@
+ from dataclasses import dataclass
+ from typing import Any, Iterable
+ 
+-from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError
++from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError, normalize_tradovate_symbol
+ from models import Allocation
+ 
+ TICK = 0.25
+@@ -144,11 +144,15 @@
+ @dataclass
+ class Executor:
+     client: CrossTradeClient
++    execution_symbol: str = "MNQ1!"
+     bracket_confirm_retries: int = 12
+     bracket_confirm_delay: float = 0.25
+     change_retries: int = 3
+     change_delay: float = 0.25
+ 
++    def _symbol(self) -> str:
++        return normalize_tradovate_symbol(self.execution_symbol)
++
+     async def _working_orders(self, account: str) -> list[dict[str, Any]]:
+         return _data_rows(await self.client.orders(account))
+ 
+@@ -184,7 +188,7 @@
+     async def place_single(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
+         before = await self._working_orders(account)
+         before_ids = {_order_id(o) for o in before if _order_id(o)}
+-        payload = {"instrument": "MNQ", "action": "buy" if alloc.side == "LONG" else "sell",
++        payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
+                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
+                    "takeProfit": alloc.tp1, "stopLoss": alloc.stop,
+                    "text": f"AutoProp {alloc.engine} {alloc.event_id}"}
+@@ -203,7 +207,7 @@
+             if owned and verify_single_bracket(orders, alloc, owned):
+                 return ExecutionReceipt(result, sorted(owned), parent_id)
+             await asyncio.sleep(self.bracket_confirm_delay)
+-        await self.client.flatten(account, "MNQ")
++        await self.client.flatten(account, self._symbol())
+         raise ProtectionFailure("single-target protective bracket failed owned exact readback; flattened")
+ 
+     async def place_core(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
+@@ -221,7 +225,7 @@
+         stops = [risk_pts] * len(targets)
+         qtys = [alloc.tp1_qty] + ([alloc.runner_qty] if alloc.runner_qty else [])
+         fmt = lambda xs: ",".join(f"{float(x):g}" for x in xs)
+-        payload = {"instrument": "MNQ", "action": "buy" if alloc.side == "LONG" else "sell",
++        payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
+                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
+                    "atmTargets": fmt(targets), "atmStops": fmt(stops),
+                    "atmQtys": ",".join(str(int(x)) for x in qtys),
+@@ -310,7 +314,7 @@
+                         return owned_ids
+                     await asyncio.sleep(self.bracket_confirm_delay)
+             await asyncio.sleep(self.bracket_confirm_delay)
+-        await self.client.flatten(account, "MNQ")
++        await self.client.flatten(account, self._symbol())
+         raise ProtectionFailure("Core owned bracket normalization/readback failed; flattened")
+ 
+ 
+--- autoprop_rc6_work/autoprop-router-main/live.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/live.py	2026-09-10 21:22:49.973141498 +0000
+@@ -6,7 +6,7 @@
+ from typing import Any
+ 
+ from allocation import allocate, AllocationBlocked
+-from crosstrade import CrossTradeClient, CrossTradeError
++from crosstrade import CrossTradeClient, CrossTradeError, InstrumentContractError, normalize_tradovate_symbol
+ from events import ParsedEvent
+ from execution import Executor, ProtectionFailure
+ from management import core_on_market_pulse, silver_lock_stop
+@@ -46,7 +46,9 @@
+             settings.CROSSTRADE_RATE_LIMIT_MAX_RETRIES,
+             settings.CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS,
+         )
++        self.execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL or 'MNQ1!')
+         self.executor = Executor(self.client,
++                                 execution_symbol=self.execution_symbol,
+                                  bracket_confirm_retries=settings.BRACKET_CONFIRM_RETRIES,
+                                  bracket_confirm_delay=settings.BRACKET_CONFIRM_RETRY_DELAY_SECONDS,
+                                  change_retries=settings.MANAGEMENT_CHANGE_RETRIES,
+@@ -54,7 +56,7 @@
+ 
+     async def position_qty(self, rule: AccountRule) -> int:
+         payload = await self.client.position(rule.crosstrade_account,
+-                                             self.settings.DEFAULT_EXECUTION_SYMBOL or 'MNQ1!')
++                                             self.execution_symbol)
+         data = payload.get('data', payload)
+         if not isinstance(data, dict) or data.get('netPos') is None:
+             raise StateUnverified('fill-reconciled position response missing netPos')
+@@ -114,10 +116,15 @@
+             raise ValueError('ENTRY missing canonical plan')
+         now = datetime.now(timezone.utc)
+         results = []
++        global_instrument_error: str | None = None
+         for rule in self.accounts:
+             if not rule.enabled:
+                 results.append({'account_id': rule.account_id, 'status': 'SKIP', 'reason': 'disabled'})
+                 continue
++            if global_instrument_error is not None:
++                results.append({'account_id': rule.account_id, 'status': 'ERROR',
++                                'reason': 'global instrument contract failure; fanout aborted before broker mutation: ' + global_instrument_error})
++                continue
+             try:
+                 await self.entry_gate(rule)
+                 state = await self.state_for(rule)
+@@ -143,22 +150,22 @@
+                 target_ids, stop_ids = await self.executor.owned_roles(rule.crosstrade_account,
+                                                                         receipt.child_order_ids)
+                 if not stop_ids:
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                     raise ProtectionFailure('accepted entry has no proven owned protective stop')
+                 try:
+                     actual_entry = await self.entry_fill_price(receipt.parent_order_id, alloc.qty)
+                 except (CrossTradeError, ProtectionFailure, ValueError) as exc:
+                     # An accepted broker position may already exist. Never manage it from the
+                     # canonical/planned Pine entry when the destination fill cannot be proven.
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                     raise ProtectionFailure(f'destination fill proof failed; flattened: {exc}') from exc
+                 signed = await self.position_qty(rule)
+                 if signed == 0 or (alloc.side == 'LONG' and signed < 0) or (alloc.side == 'SHORT' and signed > 0):
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                     raise ProtectionFailure(f'post-entry position mismatch netPos={signed}')
+                 pos_qty = abs(signed)
+                 if pos_qty != alloc.qty:
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                     raise ProtectionFailure(f'post-entry position qty {pos_qty} != routed qty {alloc.qty}')
+                 trade = ActiveTrade(account_id=rule.account_id, event_id=event.plan.event_id,
+                                     engine=alloc.engine, side=alloc.side, entry=actual_entry,
+@@ -181,9 +188,20 @@
+                                 'qty': alloc.qty, 'tp1_qty': alloc.tp1_qty,
+                                 'runner_qty': alloc.runner_qty, 'stop': alloc.stop,
+                                 'tp1': alloc.tp1, 'tp2': alloc.tp2})
+-            except (AllocationBlocked, StateUnverified, CrossTradeError, ProtectionFailure, ValueError) as exc:
++            except InstrumentContractError as exc:
++                # A symbol translation/contract failure is global to this AutoProp MNQ fanout.
++                # Stop after the first definitive failure rather than repeating the same bad
++                # broker mutation across every account.  Do not retry the entry automatically.
++                global_instrument_error = str(exc)
++                results.append({'account_id': rule.account_id, 'status': 'ERROR', 'reason': global_instrument_error})
++            except (CrossTradeError, ProtectionFailure, ValueError) as exc:
++                results.append({'account_id': rule.account_id, 'status': 'ERROR', 'reason': str(exc)})
++            except (AllocationBlocked, StateUnverified) as exc:
+                 results.append({'account_id': rule.account_id, 'status': 'SKIP', 'reason': str(exc)})
+-        return {'kind': 'ENTRY', 'engine': event.plan.engine, 'results': results}
++        out = {'kind': 'ENTRY', 'engine': event.plan.engine, 'results': results}
++        if global_instrument_error is not None:
++            out['global_execution_error'] = global_instrument_error
++        return out
+ 
+     async def _change_trade_stop(self, rule: AccountRule, trade: ActiveTrade, new_stop: float) -> None:
+         signed = await self.position_qty(rule)
+@@ -192,7 +210,7 @@
+             return
+         expected_sign = 1 if trade.side == 'LONG' else -1
+         if (signed > 0) != (expected_sign > 0):
+-            await self.client.flatten(rule.crosstrade_account, 'MNQ')
++            await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+             self.store.delete_trade(rule.account_id)
+             raise ProtectionFailure('position side mismatch during management; flattened')
+         qty = abs(signed)
+@@ -223,7 +241,7 @@
+                     results.append({'account_id': rule.account_id, 'status': 'CLOSED'})
+                     continue
+                 if (trade.side == 'LONG' and signed < 0) or (trade.side == 'SHORT' and signed > 0):
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                     self.store.delete_trade(rule.account_id)
+                     results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': 'side mismatch'})
+                     continue
+@@ -253,7 +271,7 @@
+                                     'position_qty': trade.current_position_qty})
+             except (CrossTradeError, StateUnverified, ProtectionFailure) as exc:
+                 try:
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                 finally:
+                     self.store.delete_trade(rule.account_id)
+                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': str(exc)})
+@@ -291,7 +309,7 @@
+                                 'stop': decision.new_stop, 'reason': decision.reason})
+             except (CrossTradeError, StateUnverified, ProtectionFailure) as exc:
+                 try:
+-                    await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                 finally:
+                     self.store.delete_trade(rule.account_id)
+                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED', 'reason': str(exc)})
+@@ -309,7 +327,7 @@
+             if event.engine not in {'', 'GLOBAL', 'ACCOUNT'} and trade is None:
+                 continue
+             try:
+-                await self.client.flatten(rule.crosstrade_account, 'MNQ')
++                await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                 self.store.delete_trade(rule.account_id)
+                 results.append({'account_id': rule.account_id, 'status': 'FLATTENED'})
+             except CrossTradeError as exc:
+--- autoprop_rc6_work/autoprop-router-main/main.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/main.py	2026-09-10 21:22:49.973298029 +0000
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import json
++import logging
+ import os
+ import sqlite3
+ from pathlib import Path
+@@ -18,15 +19,66 @@
+ from settings import Settings
+ from state import StateUnverified, ny_date
+ from store import Store
++from crosstrade import InstrumentContractError, normalize_tradovate_symbol
+ 
+ settings = Settings()
+ store = Store(settings.SQLITE_PATH)
+ app = FastAPI(title='AutoProp Router', version=__version__)
++logger = logging.getLogger('autoprop.router')
+ 
+ _worker_task: asyncio.Task | None = None
+ _worker_wakeup: asyncio.Event | None = None
+ 
+ 
++
++
++def _annotate_execution_result(result):
++    """Add execution outcome telemetry without changing durable worker retry semantics.
++
++    webhook_inbox.status remains DONE when processing completed. Broker/account execution
++    outcome is reported separately so a terminal all-destination failure cannot look healthy.
++    """
++    if not isinstance(result, dict) or result.get('kind') != 'ENTRY':
++        return result
++    rows = result.get('results')
++    if not isinstance(rows, list):
++        return result
++    routed = sum(1 for r in rows if isinstance(r, dict) and r.get('status') == 'ROUTED')
++    errors = []
++    skipped = 0
++    for r in rows:
++        if not isinstance(r, dict):
++            continue
++        status = str(r.get('status') or '')
++        reason = str(r.get('reason') or '')
++        # ERROR is the RC6 symbol-hotfix contract.  The HTTP prefix also recognizes
++        # already-stored RC6 incidents such as the 2026-09-10 bare-MNQ HTTP 400.
++        if status == 'ERROR' or (status == 'SKIP' and reason.startswith('HTTP ')):
++            errors.append(reason)
++        elif status == 'SKIP':
++            skipped += 1
++    total = len([r for r in rows if isinstance(r, dict)])
++    if routed > 0 and not errors:
++        outcome = 'ROUTED'
++    elif routed > 0:
++        outcome = 'PARTIAL_DESTINATION_FAILURE'
++    elif errors and len(errors) == total:
++        outcome = 'ALL_DESTINATIONS_FAILED'
++    elif errors:
++        outcome = 'NO_ROUTES_WITH_EXECUTION_FAILURES'
++    else:
++        outcome = 'NO_DESTINATIONS_ELIGIBLE'
++    out = dict(result)
++    summary = {'outcome': outcome, 'total': total, 'routed': routed,
++               'execution_errors': len(errors), 'skipped': skipped}
++    global_error = str(result.get('global_execution_error') or '')
++    if global_error:
++        summary['common_error'] = global_error
++    elif errors and len(set(errors)) == 1:
++        summary['common_error'] = errors[0]
++    out['execution_summary'] = summary
++    return out
++
+ async def _process_event(event):
+     rt = _runtime()
+     if event.kind == 'ENTRY':
+@@ -66,13 +118,25 @@
+                 raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
+             if not base['configuration_ready']:
+                 raise RuntimeError(f"router configuration not ready: {base['problems']}")
+-            result = await _process_event(event)
++            result = _annotate_execution_result(await _process_event(event))
+             store.complete_webhook(key, result)
++            summary = result.get('execution_summary') if isinstance(result, dict) else None
++            if isinstance(summary, dict):
++                outcome = str(summary.get('outcome') or '')
++                log_args = (event.kind, getattr(event, 'engine', ''), outcome,
++                            summary.get('routed'), summary.get('execution_errors'), summary.get('skipped'))
++                if outcome in {'ALL_DESTINATIONS_FAILED', 'NO_ROUTES_WITH_EXECUTION_FAILURES'}:
++                    logger.error('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
++                elif outcome == 'PARTIAL_DESTINATION_FAILURE':
++                    logger.warning('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
++                else:
++                    logger.info('AutoProp execution kind=%s engine=%s outcome=%s routed=%s errors=%s skipped=%s', *log_args)
+         except asyncio.CancelledError:
+             # Leave PROCESSING durable; startup recovery will requeue it.
+             raise
+         except Exception as exc:
+             store.fail_webhook(key, str(exc))
++            logger.exception('AutoProp webhook worker failed event_key=%s kind=%s', key, row.get('kind'))
+         finally:
+             try:
+                 store.prune_dedupe(settings.DEDUPE_RETENTION_DAYS)
+@@ -137,11 +201,16 @@
+ def health():
+     accounts = _accounts()
+     base = readiness(settings, accounts)
++    try:
++        execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL)
++    except InstrumentContractError:
++        execution_symbol = 'INVALID'
+     return {
+         'ok': True,
+         'version': __version__,
+         'execution_mode': settings.AUTOPROP_EXECUTION_MODE,
+         'management_mode': settings.AUTOPROP_MANAGEMENT_MODE,
++        'execution_symbol': execution_symbol,
+         'tradingview_alert_contract_verified': settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED,
+         'configuration_ready': base['configuration_ready'],
+         'broker_mutation_armed': base['broker_mutation_armed'],
+@@ -325,6 +394,9 @@
+     for row in rows:
+         status = str(row.get('status') or '')
+         counts[status] = counts.get(status, 0) + 1
++        # Backfill the execution summary at read time for older DONE rows too.
++        if isinstance(row.get('result'), dict):
++            row['result'] = _annotate_execution_result(row['result'])
+     return {'version': __version__, 'counts': counts, 'events': rows}
+ 
+ 
+--- autoprop_rc6_work/autoprop-router-main/readiness.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/readiness.py	2026-09-10 21:21:44.528988171 +0000
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ from models import AccountRule
+ from settings import Settings
++from crosstrade import InstrumentContractError, normalize_tradovate_symbol
+ 
+ 
+ def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:
+@@ -12,6 +13,10 @@
+         problems.append('native ATM breakeven must be disabled')
+     if settings.LIVE_MAX_QTY_PER_ACCOUNT != 0:
+         problems.append('LIVE_MAX_QTY_PER_ACCOUNT must be 0 for formula parity')
++    try:
++        normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL)
++    except InstrumentContractError as exc:
++        problems.append(f'execution symbol invalid: {exc}')
+     if settings.AUTOPROP_LIVE_ARM != 'I_UNDERSTAND_LIVE_ORDERS':
+         problems.append('live arm missing')
+     if settings.AUTOPROP_FULL_SCALE_ARM != 'I_UNDERSTAND_FULL_SCALE':
+--- autoprop_rc6_work/autoprop-router-main/version.py	2026-09-09 21:18:34.000000000 +0000
++++ AutoProp_Router_RC6_Symbol_Hotfix/version.py	2026-09-10 21:19:17.244677020 +0000
+@@ -1,2 +1,2 @@
+-__version__ = '1.2.7-exact-parity-production-rc6'
++__version__ = '1.2.7.1-exact-parity-production-rc6-symbol-hotfix'
+ VERSION = __version__  # compatibility alias for any older main.py/startup import
+--- /dev/null	2026-09-10 21:13:08.578637140 +0000
++++ /mnt/data/AutoProp_Router_RC6_Symbol_Hotfix/test_rc6_symbol_hotfix.py	2026-09-10 21:23:30.194543619 +0000
+@@ -0,0 +1,313 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++from types import SimpleNamespace
++
++import pytest
++
++from crosstrade import (
++    CrossTradeClient,
++    InstrumentContractError,
++    normalize_tradovate_symbol,
++)
++from events import parse_alert
++from execution import Executor, ProtectionFailure
++from live import LiveRouter
++from models import AccountRule, AccountState, Allocation
++from readiness import readiness
++from settings import Settings
++
++
++def _alloc(engine: str, qty: int = 3) -> Allocation:
++    if engine == "CORE":
++        return Allocation(
++            account_id="A", event_id="e", engine="CORE", side="LONG", qty=qty,
++            entry=100, stop=95, tp1=105, tp2=110,
++            tp1_qty=(qty + 1) // 2, runner_qty=qty // 2,
++            base_risk=100, effective_risk_budget=100, risk_per_contract=10,
++        )
++    return Allocation(
++        account_id="A", event_id="e", engine=engine, side="LONG", qty=qty,
++        entry=100, stop=95, tp1=105, tp1_qty=qty, runner_qty=0,
++        base_risk=100, effective_risk_budget=100, risk_per_contract=10,
++    )
++
++
++class CapturingCrossTrade(CrossTradeClient):
++    def __init__(self):
++        super().__init__("https://example.invalid", "x")
++        self.calls = []
++
++    async def _request(self, method, path, **kwargs):
++        self.calls.append((method, path, kwargs))
++        return {"ok": True}
++
++
++def test_symbol_normalizer_maps_root_to_continuous_and_rejects_other_roots():
++    assert normalize_tradovate_symbol("MNQ") == "MNQ1!"
++    assert normalize_tradovate_symbol("mnq1!") == "MNQ1!"
++    assert normalize_tradovate_symbol("MNQU6") == "MNQU6"
++    assert normalize_tradovate_symbol("MNQZ26") == "MNQZ26"
++    with pytest.raises(InstrumentContractError):
++        normalize_tradovate_symbol("ES1!")
++
++
++@pytest.mark.asyncio
++async def test_crosstrade_boundary_never_sends_bare_mnq_for_place_position_or_flatten():
++    c = CapturingCrossTrade()
++    original = {"instrument": "MNQ", "action": "buy", "qty": 1}
++    await c.place("acct", original)
++    await c.position("acct", "MNQ")
++    await c.flatten("acct", "MNQ")
++
++    assert original["instrument"] == "MNQ"  # caller payload is not mutated
++    place = c.calls[0][2]["json"]
++    pos = c.calls[1][2]["params"]
++    flat = c.calls[2][2]["json"]
++    assert place["instrument"] == "MNQ1!"
++    assert pos["instrument"] == "MNQ1!"
++    assert flat["instrument"] == "MNQ1!"
++
++
++
++
++@pytest.mark.asyncio
++async def test_remote_crosstrade_translation_400_is_classified_as_global_instrument_error(monkeypatch):
++    import crosstrade as ct
++
++    class Response:
++        status_code = 400
++        text = '{"success": false, "error": "Cannot translate \'MNQ\' to a Tradovate symbol."}'
++        headers = {}
++        content = text.encode()
++        def json(self):
++            return {"success": False, "error": "Cannot translate 'MNQ' to a Tradovate symbol."}
++
++    class Session:
++        def __init__(self, *args, **kwargs):
++            pass
++        async def __aenter__(self):
++            return self
++        async def __aexit__(self, *args):
++            return False
++        async def request(self, *args, **kwargs):
++            return Response()
++
++    monkeypatch.setattr(ct.httpx, "AsyncClient", Session)
++    c = ct.CrossTradeClient("https://example.invalid", "x", rate_limit_per_minute=999)
++    with pytest.raises(ct.InstrumentContractError, match="Cannot translate"):
++        await c._request("POST", "/x", json={"instrument": "MNQ1!"})
++
++
++class ExecutorClient:
++    def __init__(self):
++        self.last_payload = None
++        self.rows = []
++        self.flatten_symbols = []
++
++    async def orders(self, account):
++        return {"data": list(self.rows)}
++
++    async def all_orders(self):
++        return {"data": []}
++
++    async def place(self, account, payload):
++        self.last_payload = dict(payload)
++        if "atmTargets" in payload:
++            # Exact Core child topology for a 4-lot long.
++            self.rows.extend([
++                {"id": "t1", "orderType": "Limit", "qty": 2, "limitPrice": 105},
++                {"id": "s1", "orderType": "Stop", "qty": 2, "stopPrice": 95},
++                {"id": "t2", "orderType": "Limit", "qty": 2, "limitPrice": 110},
++                {"id": "s2", "orderType": "Stop", "qty": 2, "stopPrice": 95},
++            ])
++            return {"response": {"orderId": "p"}}
++        self.rows.extend([
++            {"id": "t1", "orderType": "Limit", "qty": payload["qty"], "limitPrice": payload["takeProfit"]},
++            {"id": "s1", "orderType": "Stop", "qty": payload["qty"], "stopPrice": payload["stopLoss"]},
++        ])
++        return {"response": {"orderId": "p", "osoChildIds": ["t1", "s1"]}}
++
++    async def change(self, account, oid, payload):
++        for row in self.rows:
++            if row["id"] == oid:
++                if "qty" in payload:
++                    row["qty"] = payload["qty"]
++                if "limitPrice" in payload:
++                    row["limitPrice"] = payload["limitPrice"]
++                    row["orderType"] = "Limit"
++                if "stopPrice" in payload:
++                    row["stopPrice"] = payload["stopPrice"]
++                    row["orderType"] = "Stop"
++                return {"ok": True}
++        raise AssertionError("unknown child")
++
++    async def flatten(self, account, instrument="MNQ1!"):
++        self.flatten_symbols.append(instrument)
++        return {"ok": True}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("engine", ["ORG", "SILVER", "TGIF", "DWC"])
++async def test_all_single_target_engines_emit_mnq1(engine):
++    c = ExecutorClient()
++    e = Executor(c, execution_symbol="MNQ", bracket_confirm_retries=1, bracket_confirm_delay=0, change_delay=0)
++    await e.place_single("acct", _alloc(engine), "AP-test")
++    assert c.last_payload["instrument"] == "MNQ1!"
++
++
++@pytest.mark.asyncio
++async def test_core_emits_mnq1():
++    c = ExecutorClient()
++    e = Executor(c, execution_symbol="MNQ", bracket_confirm_retries=1, bracket_confirm_delay=0, change_delay=0)
++    await e.place_core("acct", _alloc("CORE", 4), "AP-core")
++    assert c.last_payload["instrument"] == "MNQ1!"
++
++
++@pytest.mark.asyncio
++async def test_protection_failure_flatten_uses_mnq1():
++    class BadBracket(ExecutorClient):
++        async def place(self, account, payload):
++            self.last_payload = dict(payload)
++            return {"response": {"orderId": "p"}}
++
++    c = BadBracket()
++    e = Executor(c, execution_symbol="MNQ", bracket_confirm_retries=1, bracket_confirm_delay=0)
++    with pytest.raises(ProtectionFailure, match="flattened"):
++        await e.place_single("acct", _alloc("ORG"), "AP-bad")
++    assert c.flatten_symbols == ["MNQ1!"]
++
++
++def _rule(i: int) -> AccountRule:
++    return AccountRule(
++        account_id=f"CT_{i}", crosstrade_account=f"acct{i}", enabled=True,
++        rules_verified=True, account_type="personal", profile="standard",
++        starting_balance=100000, max_loss=0, max_contracts=20,
++        personal_risk_method="fixed", personal_risk_value=250,
++    )
++
++
++@pytest.mark.asyncio
++async def test_definitive_symbol_error_aborts_eight_account_fanout_after_first_broker_attempt():
++    router = LiveRouter.__new__(LiveRouter)
++    router.accounts = [_rule(i) for i in range(8)]
++    router.settings = SimpleNamespace(MAX_STATE_AGE_SECONDS=20)
++
++    async def gate(rule):
++        return None
++
++    async def state_for(rule):
++        return AccountState(
++            account_id=rule.account_id, closed_cash_balance=100000,
++            state_timestamp=datetime.now(timezone.utc), daily_ledger_verified=True,
++        )
++
++    router.entry_gate = gate
++    router.state_for = state_for
++
++    class Store:
++        def claim_event(self, key):
++            return True
++        def get_org_attempt(self, account_id):
++            return None
++
++    router.store = Store()
++
++    class FailingExecutor:
++        def __init__(self):
++            self.calls = 0
++        async def place_single(self, account, alloc, custom_order_id):
++            self.calls += 1
++            raise InstrumentContractError("HTTP 400: Cannot translate execution symbol to a Tradovate symbol")
++
++    router.executor = FailingExecutor()
++    router._custom_id = lambda event_id, account_id: f"AP-{account_id}"
++
++    event = parse_alert("AUTOPROP_ICT_FUSION|ORG|ENTRY|LONG|ENTRY=100|SL=95|TP=110")
++    out = await router.route_entry(event)
++
++    assert router.executor.calls == 1
++    assert len(out["results"]) == 8
++    assert all(row["status"] == "ERROR" for row in out["results"])
++    assert "Cannot translate" in out["global_execution_error"]
++    assert "fanout aborted before broker mutation" in out["results"][1]["reason"]
++
++
++def test_execution_summary_flags_legacy_eight_account_http400_as_terminal_execution_failure():
++    # Importing main is intentionally last because it initializes the production-style Store.
++    import main
++
++    old_rc6 = {
++        "kind": "ENTRY",
++        "engine": "ORG",
++        "results": [
++            {"account_id": f"CT_{i}", "status": "SKIP", "reason": "HTTP 400: Cannot translate 'MNQ' to a Tradovate symbol."}
++            for i in range(8)
++        ],
++    }
++    out = main._annotate_execution_result(old_rc6)
++    summary = out["execution_summary"]
++    assert summary["outcome"] == "ALL_DESTINATIONS_FAILED"
++    assert summary["total"] == 8
++    assert summary["routed"] == 0
++    assert summary["execution_errors"] == 8
++    assert summary["skipped"] == 0
++    assert "Cannot translate 'MNQ'" in summary["common_error"]
++
++
++def test_execution_summary_preserves_intentional_all_skip_as_no_eligible_destinations():
++    import main
++
++    result = {
++        "kind": "ENTRY",
++        "engine": "ORG",
++        "results": [
++            {"account_id": "A", "status": "SKIP", "reason": "disabled"},
++            {"account_id": "B", "status": "SKIP", "reason": "duplicate event"},
++        ],
++    }
++    assert main._annotate_execution_result(result)["execution_summary"]["outcome"] == "NO_DESTINATIONS_ELIGIBLE"
++
++
++def test_readiness_validates_execution_symbol_contract():
++    rule = _rule(1)
++    good = Settings(
++        _env_file=None, CROSSTRADE_TOKEN="x", AUTOPROP_WEBHOOK_TOKEN="y",
++        AUTOPROP_LIVE_ARM="I_UNDERSTAND_LIVE_ORDERS",
++        AUTOPROP_FULL_SCALE_ARM="I_UNDERSTAND_FULL_SCALE",
++        TRADINGVIEW_ALERT_CONTRACT_VERIFIED=False, DEFAULT_EXECUTION_SYMBOL="MNQ",
++    )
++    r = readiness(good, [rule])
++    assert r["configuration_ready"] is True
++
++    bad = good.model_copy(update={"DEFAULT_EXECUTION_SYMBOL": "ES1!"})
++    r2 = readiness(bad, [rule])
++    assert r2["configuration_ready"] is False
++    assert any("execution symbol invalid" in p for p in r2["problems"])
++
++
++def test_webhook_inbox_endpoint_backfills_legacy_all_destination_failure(monkeypatch, tmp_path):
++    import main
++    from fastapi.testclient import TestClient
++    from store import Store
++
++    test_store = Store(str(tmp_path / "inbox.sqlite3"))
++    key = "legacy-org"
++    assert test_store.enqueue_webhook(key, "raw", "ENTRY")
++    claimed = test_store.claim_next_webhook()
++    assert claimed and claimed["event_key"] == key
++    test_store.complete_webhook(key, {
++        "kind": "ENTRY",
++        "engine": "ORG",
++        "results": [
++            {"account_id": f"CT_{i}", "status": "SKIP", "reason": "HTTP 400: Cannot translate 'MNQ' to a Tradovate symbol."}
++            for i in range(8)
++        ],
++    })
++    monkeypatch.setattr(main, "store", test_store)
++    monkeypatch.setattr(main.settings, "AUTOPROP_WEBHOOK_TOKEN", "secret")
++    with TestClient(main.app) as client:
++        payload = client.get("/admin/webhook-inbox/secret").json()
++    summary = payload["events"][0]["result"]["execution_summary"]
++    assert summary["outcome"] == "ALL_DESTINATIONS_FAILED"
++    assert summary["execution_errors"] == 8

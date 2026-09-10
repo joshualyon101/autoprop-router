@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError
+from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError, normalize_tradovate_symbol
 from models import Allocation
 
 TICK = 0.25
@@ -144,10 +144,14 @@ class ExecutionReceipt:
 @dataclass
 class Executor:
     client: CrossTradeClient
+    execution_symbol: str = "MNQ1!"
     bracket_confirm_retries: int = 12
     bracket_confirm_delay: float = 0.25
     change_retries: int = 3
     change_delay: float = 0.25
+
+    def _symbol(self) -> str:
+        return normalize_tradovate_symbol(self.execution_symbol)
 
     async def _working_orders(self, account: str) -> list[dict[str, Any]]:
         return _data_rows(await self.client.orders(account))
@@ -184,7 +188,7 @@ class Executor:
     async def place_single(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
         before = await self._working_orders(account)
         before_ids = {_order_id(o) for o in before if _order_id(o)}
-        payload = {"instrument": "MNQ", "action": "buy" if alloc.side == "LONG" else "sell",
+        payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
                    "takeProfit": alloc.tp1, "stopLoss": alloc.stop,
                    "text": f"AutoProp {alloc.engine} {alloc.event_id}"}
@@ -203,7 +207,7 @@ class Executor:
             if owned and verify_single_bracket(orders, alloc, owned):
                 return ExecutionReceipt(result, sorted(owned), parent_id)
             await asyncio.sleep(self.bracket_confirm_delay)
-        await self.client.flatten(account, "MNQ")
+        await self.client.flatten(account, self._symbol())
         raise ProtectionFailure("single-target protective bracket failed owned exact readback; flattened")
 
     async def place_core(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
@@ -221,7 +225,7 @@ class Executor:
         stops = [risk_pts] * len(targets)
         qtys = [alloc.tp1_qty] + ([alloc.runner_qty] if alloc.runner_qty else [])
         fmt = lambda xs: ",".join(f"{float(x):g}" for x in xs)
-        payload = {"instrument": "MNQ", "action": "buy" if alloc.side == "LONG" else "sell",
+        payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
                    "atmTargets": fmt(targets), "atmStops": fmt(stops),
                    "atmQtys": ",".join(str(int(x)) for x in qtys),
@@ -310,7 +314,7 @@ class Executor:
                         return owned_ids
                     await asyncio.sleep(self.bracket_confirm_delay)
             await asyncio.sleep(self.bracket_confirm_delay)
-        await self.client.flatten(account, "MNQ")
+        await self.client.flatten(account, self._symbol())
         raise ProtectionFailure("Core owned bracket normalization/readback failed; flattened")
 
 
