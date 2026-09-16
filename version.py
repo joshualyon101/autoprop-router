@@ -1,2 +1,2 @@
-__version__ = '1.2.8-exact-parity-six-engine-asw-rc1'
+__version__ = '1.2.8.1-exact-parity-six-engine-bracket-readback-hotfix'
 VERSION = __version__

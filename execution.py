@@ -77,9 +77,24 @@ def verify_core_bracket(orders: Iterable[dict[str, Any]], alloc: Allocation,
 
 
 def _data_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten common CrossTrade envelopes into order-like dict rows.
+
+    Tradovate GET /tv/orders returns identity envelopes whose nested ``data``
+    contains the raw order list; per-account GET /orders returns the raw list
+    directly. Keep this helper tolerant of both shapes.
+    """
     d = payload.get("data", payload)
     if isinstance(d, list):
-        return [x for x in d if isinstance(x, dict)]
+        out: list[dict[str, Any]] = []
+        for x in d:
+            if not isinstance(x, dict):
+                continue
+            nested = x.get("data")
+            if isinstance(nested, list) and any(k in x for k in ("environment", "userId", "name")):
+                out.extend(y for y in nested if isinstance(y, dict))
+            else:
+                out.append(x)
+        return out
     if isinstance(d, dict):
         for key in ("orders", "items", "data"):
             if isinstance(d.get(key), list):
@@ -153,8 +168,87 @@ class Executor:
     def _symbol(self) -> str:
         return normalize_tradovate_symbol(self.execution_symbol)
 
-    async def _working_orders(self, account: str) -> list[dict[str, Any]]:
+    async def _raw_working_orders(self, account: str) -> list[dict[str, Any]]:
         return _data_rows(await self.client.orders(account))
+
+    async def _order_snapshot(self, account: str, oid: str, raw: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Return an order row enriched with Tradovate OrderVersion fields.
+
+        CrossTrade's Tradovate per-account working-orders endpoint intentionally returns
+        raw Order entities only; quantity, order type and prices live on OrderVersion.
+        Exact bracket verification therefore MUST use the order lifecycle endpoint.
+        """
+        raw = dict(raw or {})
+        # Existing unit fakes / enriched callers may already provide everything needed.
+        if (raw.get("orderType") is not None and _qty(raw) > 0 and
+                (raw.get("limitPrice") is not None or raw.get("stopPrice") is not None or raw.get("price") is not None)):
+            return raw
+        fn = getattr(self.client, "order_lifecycle", None)
+        if fn is None:
+            if raw:
+                return raw
+            # Compatibility with existing test doubles / alternate clients that already
+            # return enriched order rows but do not expose lifecycle. Production Tradovate
+            # has lifecycle and therefore never relies on this fallback.
+            try:
+                for candidate in _data_rows(await self.client.orders(account)):
+                    if _order_id(candidate) == str(oid):
+                        return candidate
+            except Exception:
+                return None
+            return None
+        payload = await fn(account, str(oid))
+        unavailable = {str(x) for x in (payload.get("unavailable") or [])} if isinstance(payload, dict) else set()
+        if "version" in unavailable:
+            return None
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            return None
+        order = data.get("order") if isinstance(data.get("order"), dict) else {}
+        version = data.get("version") if isinstance(data.get("version"), dict) else {}
+        if not version:
+            return None
+        order_id = str(order.get("id") or version.get("orderId") or oid)
+        out: dict[str, Any] = {
+            **raw,
+            "id": order_id,
+            "orderId": order_id,
+            "orderType": version.get("orderType"),
+            "qty": version.get("orderQty"),
+            "quantity": version.get("orderQty"),
+            "orderQty": version.get("orderQty"),
+            "limitPrice": version.get("price"),
+            "price": version.get("price"),
+            "stopPrice": version.get("stopPrice"),
+            "orderState": order.get("ordStatus") or raw.get("ordStatus") or raw.get("orderState"),
+            "ordStatus": order.get("ordStatus") or raw.get("ordStatus"),
+        }
+        commands = data.get("commands") if isinstance(data.get("commands"), list) else []
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            cid = command.get("clOrdId") or command.get("clordId") or command.get("cl_ord_id")
+            if cid:
+                out["clOrdId"] = str(cid)
+                break
+        return out
+
+    @staticmethod
+    def _is_live_snapshot(row: dict[str, Any]) -> bool:
+        status = str(row.get("ordStatus") or row.get("orderState") or "").strip().lower()
+        return status not in {"filled", "canceled", "cancelled", "rejected", "expired", "completed"}
+
+    async def _working_orders(self, account: str) -> list[dict[str, Any]]:
+        raw_rows = await self._raw_working_orders(account)
+        out: list[dict[str, Any]] = []
+        for raw in raw_rows:
+            oid = _order_id(raw)
+            if not oid:
+                continue
+            snap = await self._order_snapshot(account, oid, raw)
+            if snap is not None and self._is_live_snapshot(snap):
+                out.append(snap)
+        return out
 
     async def _all_orders(self) -> list[dict[str, Any]]:
         fn = getattr(self.client, "all_orders", None)
@@ -163,30 +257,46 @@ class Executor:
         return _data_rows(await fn())
 
     async def _reconcile_custom_order(self, account: str, custom_order_id: str) -> str | None:
-        # Search working/history rows for caller-supplied clOrdId and return the real
-        # Tradovate parent order id. No PLACE resend occurs.
-        for o in await self._working_orders(account):
-            if _custom_id_match(o, custom_order_id) and _order_id(o):
-                return _order_id(o)
-        for o in await self._all_orders():
-            if _custom_id_match(o, custom_order_id) and _order_id(o):
-                return _order_id(o)
+        # Search the account's working orders first, then current-session history.
+        # Tradovate keeps clOrdId on the New command, so lifecycle enrichment is required.
+        candidates = await self._raw_working_orders(account)
+        seen: set[str] = set()
+        for raw in [*candidates, *(await self._all_orders())]:
+            oid = _order_id(raw)
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            try:
+                snap = await self._order_snapshot(account, oid, raw)
+            except CrossTradeError:
+                # All-orders spans identities; an order not owned by this account is expected.
+                continue
+            if snap is not None and _custom_id_match(snap, custom_order_id):
+                return _order_id(snap)
         return None
 
     async def _discover_owned_children(self, account: str, before_ids: set[str],
                                        response_ids: set[str]) -> tuple[list[dict[str, Any]], set[str]]:
-        rows = await self._working_orders(account)
-        present = {_order_id(o) for o in rows if _order_id(o)}
+        raw_rows = await self._raw_working_orders(account)
+        present = {_order_id(o) for o in raw_rows if _order_id(o)}
         if response_ids:
             owned = response_ids & present
-            # If response named children that are not yet visible, wait rather than widening ownership.
-            return rows, owned
-        # Ambiguous/no-child-ID fallback: only orders newly appearing after this placement can
-        # be considered. Never adopt pre-existing account orders by price/quantity similarity.
-        return rows, present - before_ids
+        else:
+            # Ambiguous/no-child-ID fallback: only orders newly appearing after this placement can
+            # be considered. Never adopt pre-existing account orders by price/quantity similarity.
+            owned = present - before_ids
+        rows: list[dict[str, Any]] = []
+        raw_map = {_order_id(o): o for o in raw_rows if _order_id(o)}
+        for oid in sorted(owned):
+            snap = await self._order_snapshot(account, oid, raw_map.get(oid))
+            if snap is not None and self._is_live_snapshot(snap):
+                rows.append(snap)
+        # If response named children that are not yet visible, ``owned`` stays incomplete
+        # and the caller retries rather than widening ownership.
+        return rows, owned
 
     async def place_single(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
-        before = await self._working_orders(account)
+        before = await self._raw_working_orders(account)
         before_ids = {_order_id(o) for o in before if _order_id(o)}
         payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
@@ -262,7 +372,7 @@ class Executor:
     async def place_core(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
         if alloc.tp2 is None:
             raise ValueError("Core allocation missing TP2")
-        before = await self._working_orders(account)
+        before = await self._raw_working_orders(account)
         before_ids = {_order_id(o) for o in before if _order_id(o)}
         # Immediate native multi-tier protection. CrossTrade's ATM arrays are documented as
         # comma-separated strings of fill-relative offsets/quantities. They are provisional;
@@ -293,10 +403,10 @@ class Executor:
         return ExecutionReceipt(result, sorted(owned), parent_id)
 
     async def _read_order(self, account: str, oid: str) -> dict[str, Any] | None:
-        for o in await self._working_orders(account):
-            if _order_id(o) == str(oid):
-                return o
-        return None
+        try:
+            return await self._order_snapshot(account, str(oid))
+        except CrossTradeError:
+            return None
 
     async def _change_exact(self, account: str, oid: str, payload: dict[str, Any]) -> None:
         last: Exception | None = None
@@ -358,7 +468,11 @@ class Executor:
                 except ProtectionFailure:
                     break
                 for _j in range(self.bracket_confirm_retries):
-                    check = await self._working_orders(account)
+                    check = []
+                    for oid in sorted(owned_ids):
+                        snap = await self._order_snapshot(account, oid)
+                        if snap is not None and self._is_live_snapshot(snap):
+                            check.append(snap)
                     if verify_core_bracket(check, alloc, owned_ids):
                         return owned_ids
                     await asyncio.sleep(self.bracket_confirm_delay)
@@ -371,16 +485,22 @@ class Executor:
         return await self._working_orders(account)
 
     async def owned_roles(self, account: str, child_order_ids: list[str]) -> tuple[list[str], list[str]]:
-        ids = {str(x) for x in child_order_ids}
-        rows = _owned(await self._working_orders(account), ids)
+        rows: list[dict[str, Any]] = []
+        for oid in child_order_ids:
+            snap = await self._order_snapshot(account, str(oid))
+            if snap is not None and self._is_live_snapshot(snap):
+                rows.append(snap)
         targets, stops = classify_children(rows)
         return ([_order_id(o) for o in targets if _order_id(o)],
                 [_order_id(o) for o in stops if _order_id(o)])
 
     async def change_stop_orders(self, account: str, stop_order_ids: list[str],
                                  new_stop: float, expected_qty: int) -> list[str]:
-        ids = {str(x) for x in stop_order_ids}
-        rows = _owned(await self._working_orders(account), ids)
+        rows: list[dict[str, Any]] = []
+        for oid in stop_order_ids:
+            snap = await self._order_snapshot(account, str(oid))
+            if snap is not None and self._is_live_snapshot(snap):
+                rows.append(snap)
         _targets, stops = classify_children(rows)
         live = [o for o in stops if _order_id(o)]
         if not live or sum(_qty(o) for o in live) != int(expected_qty):
@@ -388,7 +508,11 @@ class Executor:
         for o in live:
             await self._change_exact(account, _order_id(o),
                                      {'qty': _qty(o), 'orderType': 'stop', 'stopPrice': new_stop})
-        check = _owned(await self._working_orders(account), {_order_id(o) for o in live})
+        check: list[dict[str, Any]] = []
+        for o in live:
+            snap = await self._order_snapshot(account, _order_id(o))
+            if snap is not None and self._is_live_snapshot(snap):
+                check.append(snap)
         _t2, s2 = classify_children(check)
         exact = [o for o in s2 if tick_equal(_price(o, 'stop'), new_stop)]
         if sum(_qty(o) for o in exact) != int(expected_qty):

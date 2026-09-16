@@ -148,9 +148,10 @@ class CrossTradeClient:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
                     r = await client.request(method_u, url, headers=self._headers(), **kwargs)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
+                detail = str(e).strip() or type(e).__name__
                 if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
-                    raise AmbiguousMutation(str(e)) from e
-                raise CrossTradeError(str(e)) from e
+                    raise AmbiguousMutation(f"{method_u} {path} network error: {detail}") from e
+                raise CrossTradeError(f"{method_u} {path} network error: {detail}") from e
 
             if r.status_code == 429:
                 explicit, retry_after = _explicit_rate_limit_response(r)
