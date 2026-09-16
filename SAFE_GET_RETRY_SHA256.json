@@ -1,0 +1,20 @@
+{
+  "version": "1.2.8.2-exact-parity-six-engine-safe-get-retry-hotfix",
+  "changed_vs_1.2.8.1": [
+    {
+      "file": "crosstrade.py",
+      "old_sha256": "6a8ed7548060126e99c041b38d670786ace52fc4ea068b5855b1b503aa7a9c2d",
+      "new_sha256": "8dcf4f4bb74a48dea753ec84beafe3f7cb879125aa12c5fed806822cef57709d"
+    },
+    {
+      "file": "test_safe_get_retry_hotfix.py",
+      "old_sha256": null,
+      "new_sha256": "ffb953945dfb4cb5b900d62dca08970933bd6271ada6917afac73bdbebd9e6cf"
+    },
+    {
+      "file": "version.py",
+      "old_sha256": "0485af94928de5a8339c51aaec970c1ca7c2833e325066560c5ffcf161ef75e0",
+      "new_sha256": "5328f2ae84dae3704a3283aded7ca5e04f9b576fc33ffcabcbf43e2fc63a0ae9"
+    }
+  ]
+}

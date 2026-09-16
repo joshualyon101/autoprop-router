@@ -134,6 +134,10 @@ class CrossTradeClient:
     rate_limit_window_seconds: float = 60.0
     rate_limit_max_retries: int = 8
     rate_limit_fallback_seconds: float = 1.0
+    # Read-only broker calls are safe to retry on transient transport/snapshot-refresh
+    # failures. Mutations retain the strict ambiguous-mutation no-resend contract.
+    get_retry_max_retries: int = 2
+    get_retry_delay_seconds: float = 0.5
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
@@ -142,6 +146,7 @@ class CrossTradeClient:
         url = self.base_url.rstrip("/") + path
         method_u = method.upper()
         attempts = 0
+        get_attempts = 0
         while True:
             await _acquire_rate_slot(self.rate_limit_per_minute, self.rate_limit_window_seconds)
             try:
@@ -151,11 +156,33 @@ class CrossTradeClient:
                 detail = str(e).strip() or type(e).__name__
                 if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                     raise AmbiguousMutation(f"{method_u} {path} network error: {detail}") from e
-                raise CrossTradeError(f"{method_u} {path} network error: {detail}") from e
+                if method_u == "GET" and get_attempts < max(0, int(self.get_retry_max_retries)):
+                    get_attempts += 1
+                    await asyncio.sleep(max(0.0, float(self.get_retry_delay_seconds)) * get_attempts)
+                    continue
+                raise CrossTradeError(f"{method_u} {path} network error after {get_attempts + 1} attempt(s): {detail}") from e
 
             if r.status_code == 429:
                 explicit, retry_after = _explicit_rate_limit_response(r)
                 retry_after = retry_after if retry_after > 0 else self.rate_limit_fallback_seconds
+                # A GET-only account snapshot refresh can overlap another CrossTrade refresh.
+                # It is explicitly non-mutating and therefore safe to retry after retryAfter.
+                snapshot_refresh_pending = False
+                if method_u == "GET":
+                    try:
+                        payload = r.json()
+                        snapshot_refresh_pending = (
+                            isinstance(payload, dict)
+                            and payload.get("success") is False
+                            and str(payload.get("error") or "").lower() == "snapshot_refresh_pending"
+                        )
+                    except Exception:
+                        snapshot_refresh_pending = False
+                if snapshot_refresh_pending and get_attempts < max(0, int(self.get_retry_max_retries)):
+                    get_attempts += 1
+                    await _apply_global_cooldown(max(retry_after, self.get_retry_delay_seconds))
+                    continue
+
                 # An explicit {success:false,error:"rate_limited"} response proves the
                 # broker rejected the request. It is therefore safe to retry even for a
                 # mutation; this is not the ambiguous PLACE case guarded above.

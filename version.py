@@ -1,2 +1,2 @@
-__version__ = '1.2.8.1-exact-parity-six-engine-bracket-readback-hotfix'
+__version__ = '1.2.8.2-exact-parity-six-engine-safe-get-retry-hotfix'
 VERSION = __version__
