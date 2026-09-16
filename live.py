@@ -582,19 +582,28 @@ class LiveRouter:
                     continue
                 trade.previous_position_qty = trade.current_position_qty
                 trade.current_position_qty = abs(signed)
-                decision = silver_lock_stop(trade)
+                fields = event.fields or {}
+                try:
+                    stage = int(float(fields.get('STAGE', '0')))
+                except (TypeError, ValueError):
+                    raise ProtectionFailure('Silver staged stop event missing valid STAGE')
+                decision = silver_lock_stop(trade, stage)
                 if decision.new_stop is None:
-                    results.append({'account_id': rule.account_id, 'status': 'NO_CHANGE'})
+                    trade.stop_stage = max(int(trade.stop_stage or 0), stage)
+                    self.store.save_trade(trade)
+                    results.append({'account_id': rule.account_id, 'status': 'NO_CHANGE',
+                                    'stage': stage, 'reason': decision.reason})
                     continue
                 live_stop_ids = await self.executor.change_stop_orders(rule.crosstrade_account,
                                                                        trade.stop_order_ids,
                                                                        decision.new_stop,
                                                                        trade.current_position_qty)
                 trade.current_stop = decision.new_stop
+                trade.stop_stage = max(int(trade.stop_stage or 0), stage)
                 trade.stop_order_ids = live_stop_ids
                 self.store.save_trade(trade)
                 results.append({'account_id': rule.account_id, 'status': 'STOP_MOVED',
-                                'stop': decision.new_stop, 'reason': decision.reason})
+                                'stage': stage, 'stop': decision.new_stop, 'reason': decision.reason})
             except (CrossTradeError, StateUnverified, ProtectionFailure) as exc:
                 try:
                     await self.client.flatten(rule.crosstrade_account, self.execution_symbol)

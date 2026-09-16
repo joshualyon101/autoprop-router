@@ -69,11 +69,20 @@ def test_core_runner_trail_short_formula():
     d=core_on_market_pulse(t,pulse(runner_trail_high=90,atr=5))
     assert d.new_stop==90.5
 
-def test_silver_3r_event_locks_half_r_but_never_loosens():
-    t=trade(engine="SILVER",current_stop=90)
-    d=silver_lock_stop(t); assert d.new_stop==105
-    t.current_stop=106
-    assert silver_lock_stop(t).new_stop is None
+def test_silver_stage1_2r_locks_quarter_r():
+    t=trade(engine="SILVER",side="SHORT",entry=100,initial_stop=110,current_stop=110,stop_stage=0)
+    d=silver_lock_stop(t,1)
+    assert d.new_stop==97.5 and d.reason=="SILVER_2R_LOCK_0.25R"
+
+def test_silver_stage2_3r_locks_half_r():
+    t=trade(engine="SILVER",side="SHORT",entry=100,initial_stop=110,current_stop=97.5,stop_stage=1)
+    d=silver_lock_stop(t,2)
+    assert d.new_stop==95 and d.reason=="SILVER_3R_LOCK_0.50R"
+
+def test_silver_stage_management_is_monotonic_and_idempotent():
+    t=trade(engine="SILVER",side="SHORT",entry=100,initial_stop=110,current_stop=94,stop_stage=2)
+    assert silver_lock_stop(t,1).new_stop is None
+    assert silver_lock_stop(t,2).new_stop is None
 
 def test_org_reentry_requires_destination_stop_child_fill():
     fills=[{"orderId":"target1","qty":3},{"orderId":"stopABC","qty":0}]

@@ -71,10 +71,25 @@ def core_on_market_pulse(trade: ActiveTrade, pulse: MarketPulse) -> StopDecision
     return StopDecision(new_stop if new_stop != trade.current_stop else None, reason, transitioned)
 
 
-def silver_lock_stop(trade: ActiveTrade) -> StopDecision:
+SILVER_STOP_CONTRACT = "SILVER_SB35_STAGE_V1"
+
+
+def silver_lock_stop(trade: ActiveTrade, stage: int) -> StopDecision:
+    """Apply the frozen SB35 staged protection using the destination's actual fill.
+
+    Pine owns the canonical favorable-excursion trigger. The Router receives only the
+    stage identity, then computes the destination stop from that account's proven broker
+    fill and original structural stop. Stage transitions are monotonic and idempotent.
+    """
     if trade.engine != "SILVER":
         return StopDecision(None)
+    if stage not in {1, 2}:
+        raise ValueError(f"unsupported Silver protection stage {stage}")
+    if stage <= int(trade.stop_stage or 0):
+        return StopDecision(None, f"SILVER_STAGE_{stage}_ALREADY_APPLIED")
     r = abs(trade.entry - trade.initial_stop)
-    candidate = trade.entry + 0.50 * r if trade.side == "LONG" else trade.entry - 0.50 * r
+    lock_r = 0.25 if stage == 1 else 0.50
+    candidate = trade.entry + lock_r * r if trade.side == "LONG" else trade.entry - lock_r * r
     tightened = _tighten(trade.side, trade.current_stop, candidate)
-    return StopDecision(tightened if tightened != trade.current_stop else None, "SILVER_3R_LOCK_0.5R")
+    reason = "SILVER_2R_LOCK_0.25R" if stage == 1 else "SILVER_3R_LOCK_0.50R"
+    return StopDecision(tightened if tightened != trade.current_stop else None, reason)

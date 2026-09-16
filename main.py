@@ -20,6 +20,7 @@ from settings import Settings
 from state import StateUnverified, ny_date
 from store import Store
 from crosstrade import InstrumentContractError, normalize_tradovate_symbol
+from management import SILVER_STOP_CONTRACT
 
 settings = Settings()
 store = Store(settings.SQLITE_PATH)
@@ -248,6 +249,7 @@ def health():
         'registered_accounts': len(accounts),
         'active_trades': len(store.all_trades()),
         'asw_limit_contract': 'ASW_LIMIT_V1',
+        'silver_stop_contract': SILVER_STOP_CONTRACT,
         'asw_pending_limits': len(store.all_asw_pending()),
     }
 

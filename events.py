@@ -135,6 +135,19 @@ def parse_alert(raw: str) -> ParsedEvent:
         return ParsedEvent(kind="ENTRY", plan=plan, engine=engine, side=side, fields=d, raw=raw)
 
     if engine == "SILVER" and action in {"MOVE_STOP", "STOP_MOVE"}:
+        if d.get("CONTRACT") != "SILVER_SB35_STAGE_V1":
+            raise ValueError("Silver MOVE_STOP requires CONTRACT=SILVER_SB35_STAGE_V1")
+        stage = _i(d, "STAGE")
+        lock_r = _f(d, "LOCK_R")
+        trigger_r = _f(d, "TRIGGER_R")
+        expected = {1: (2.0, 0.25), 2: (3.0, 0.50)}
+        if stage not in expected:
+            raise ValueError("Silver MOVE_STOP stage must be 1 or 2")
+        exp_trigger, exp_lock = expected[stage]
+        if trigger_r is None or abs(trigger_r - exp_trigger) > 1e-9:
+            raise ValueError("Silver MOVE_STOP trigger R does not match staged contract")
+        if lock_r is None or abs(lock_r - exp_lock) > 1e-9:
+            raise ValueError("Silver MOVE_STOP lock R does not match staged contract")
         return ParsedEvent(kind="SILVER_STOP_MOVE", engine=engine, side=side, fields=d, raw=raw)
     if (engine == "ACCOUNT" and action in {"CHALLENGE_MLL_FAIL_EXIT", "FUNDED_MLL_FAIL_EXIT"}) or action in {"TIME_EXIT", "FAILSAFE_EXIT", "REQUIRED_FLAT_EXIT", "FRIDAY_FLAT", "REQUIRED_FLAT"}:
         return ParsedEvent(kind="HARD_FLAT", engine=engine, side=side, fields=d, raw=raw)
