@@ -81,7 +81,7 @@ class VerifiedRiskState(BaseModel):
 
 class CanonicalPlan(BaseModel):
     event_id: str
-    engine: Literal["ORG", "SILVER", "CORE", "TGIF", "DWC"]
+    engine: Literal["ORG", "SILVER", "CORE", "TGIF", "DWC", "ASW"]
     side: Side
     entry: float
     stop: float
@@ -95,6 +95,9 @@ class CanonicalPlan(BaseModel):
     native_time_ms: Optional[int] = None
     native_bar_index: Optional[int] = None
     source_qty: Optional[int] = None
+    contract_risk_dollars: Optional[float] = None
+    expiry_time_ms: Optional[int] = None
+    contract_version: str = ""
 
     @model_validator(mode="after")
     def validate_geometry(self):
@@ -104,6 +107,21 @@ class CanonicalPlan(BaseModel):
             raise ValueError("long stop must be below entry")
         if self.side == "SHORT" and not self.stop > self.entry:
             raise ValueError("short stop must be above entry")
+        if self.engine == "ASW":
+            if self.contract_version != "ASW_LIMIT_V1":
+                raise ValueError("ASW requires ASW_LIMIT_V1 contract")
+            if self.source_qty is None or self.source_qty < 1:
+                raise ValueError("ASW requires native source_qty >= 1")
+            if self.native_time_ms is None or self.expiry_time_ms is None:
+                raise ValueError("ASW requires signal and expiry timestamps")
+            if self.expiry_time_ms <= self.native_time_ms:
+                raise ValueError("ASW expiry must be after signal time")
+            if self.contract_risk_dollars is None or self.contract_risk_dollars <= 0:
+                raise ValueError("ASW requires contract risk")
+            if self.side == "LONG" and not self.entry < self.tp1:
+                raise ValueError("ASW long target must be above entry")
+            if self.side == "SHORT" and not self.entry > self.tp1:
+                raise ValueError("ASW short target must be below entry")
         return self
 
 
@@ -123,6 +141,25 @@ class Allocation(BaseModel):
     effective_risk_budget: float
     risk_per_contract: float
     skip_reason: str = ""
+
+
+class AswPending(BaseModel):
+    account_id: str
+    crosstrade_account: str
+    event_id: str
+    side: Side
+    qty: int
+    native_qty: int
+    entry: float
+    stop: float
+    target: float
+    risk_per_contract: float
+    signal_time_ms: int
+    expiry_time_ms: int
+    parent_order_id: str
+    custom_order_id: str
+    child_order_ids: list[str] = []
+    created_at: datetime
 
 
 class MarketPulse(BaseModel):

@@ -210,6 +210,55 @@ class Executor:
         await self.client.flatten(account, self._symbol())
         raise ProtectionFailure("single-target protective bracket failed owned exact readback; flattened")
 
+    async def place_asw_limit(self, account: str, alloc: Allocation, custom_order_id: str,
+                              *, expiry_time_ms: int, now_ms: int) -> ExecutionReceipt:
+        if alloc.engine != "ASW":
+            raise ValueError("place_asw_limit requires ASW allocation")
+        remaining_ms = int(expiry_time_ms) - int(now_ms)
+        if remaining_ms <= 0:
+            raise ProtectionFailure("ASW limit candidate already expired")
+        cancel_after = max(1, min(180, int((remaining_ms + 59999) // 60000)))
+        payload = {
+            "instrument": self._symbol(),
+            "action": "buy" if alloc.side == "LONG" else "sell",
+            "qty": alloc.qty,
+            "orderType": "limit",
+            "limitPrice": alloc.entry,
+            "tif": "day",
+            "orderId": custom_order_id,
+            "takeProfit": alloc.tp1,
+            "stopLoss": alloc.stop,
+            "cancelAfter": cancel_after,
+            "requireMarketPosition": "flat",
+            "maxPositions": 1,
+            "text": f"AutoProp ASW {alloc.event_id}"[:64],
+        }
+        try:
+            result = await self.client.place(account, payload)
+        except AmbiguousMutation:
+            parent_id = await self._reconcile_custom_order(account, custom_order_id)
+            if not parent_id:
+                raise ProtectionFailure("ambiguous ASW LIMIT PLACE could not be reconciled; no resend")
+            # We cannot prove the two OSO child identities from a lost PLACE response.
+            # Cancel/flatten instead of managing an ownership-ambiguous bracket.
+            try:
+                await self.client.cancel_order(account, parent_id)
+            except Exception:
+                pass
+            await self.client.flatten(account, self._symbol())
+            raise ProtectionFailure("ambiguous ASW LIMIT accepted but OSO child ownership unavailable; canceled/flattened")
+        parent_id = _place_parent_id(result)
+        child_ids = _place_child_ids(result)
+        if not parent_id or len(child_ids) < 2:
+            if parent_id:
+                try:
+                    await self.client.cancel_order(account, parent_id)
+                except Exception:
+                    pass
+            await self.client.flatten(account, self._symbol())
+            raise ProtectionFailure("ASW LIMIT placement missing parent/OSO child identity; canceled/flattened")
+        return ExecutionReceipt(result, sorted(child_ids), parent_id)
+
     async def place_core(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
         if alloc.tp2 is None:
             raise ValueError("Core allocation missing TP2")

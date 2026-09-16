@@ -93,6 +93,35 @@ def parse_alert(raw: str) -> ParsedEvent:
     side = parts[3] if len(parts) > 3 and parts[3] in {"LONG", "SHORT"} else ""
     d = _fields(parts[4:] if side else parts[3:])
 
+    if engine == "ASW" and action == "WORKING_LIMIT":
+        if d.get("CONTRACT") != "ASW_LIMIT_V1":
+            raise ValueError("ASW WORKING_LIMIT requires CONTRACT=ASW_LIMIT_V1")
+        if str(d.get("ORDER_TYPE", "")).upper() != "LIMIT":
+            raise ValueError("ASW WORKING_LIMIT requires ORDER_TYPE=LIMIT")
+        entry, stop, target = _f(d, "ENTRY"), _f(d, "SL"), _f(d, "TP")
+        native_qty, rpc = _i(d, "Q0"), _f(d, "CR")
+        signal_time, expiry = _i(d, "T5"), _i(d, "EXP")
+        if None in (entry, stop, target, native_qty, rpc, signal_time, expiry) or not side:
+            raise ValueError("ASW WORKING_LIMIT missing exact native plan fields")
+        plan = CanonicalPlan(
+            event_id=stable_event_id(raw), engine="ASW", side=side,
+            entry=entry, stop=stop, tp1=target,
+            source_qty=native_qty, contract_risk_dollars=rpc,
+            native_time_ms=signal_time, expiry_time_ms=expiry,
+            contract_version="ASW_LIMIT_V1",
+        )
+        return ParsedEvent(kind="ASW_WORKING_LIMIT", plan=plan, engine=engine, side=side, fields=d, raw=raw)
+
+    if engine == "ASW" and action == "CANCEL_PENDING":
+        if d.get("CONTRACT") != "ASW_LIMIT_V1" or _i(d, "T5") is None or not side:
+            raise ValueError("ASW CANCEL_PENDING missing contract/side/T5")
+        return ParsedEvent(kind="ASW_CANCEL_PENDING", engine=engine, side=side, fields=d, raw=raw)
+
+    if engine == "ASW" and action == "TIME_FLAT":
+        if d.get("CONTRACT") != "ASW_LIMIT_V1" or not side:
+            raise ValueError("ASW TIME_FLAT missing contract/side")
+        return ParsedEvent(kind="ASW_TIME_FLAT", engine=engine, side=side, fields=d, raw=raw)
+
     if action == "ENTRY" and engine in {"ORG", "SILVER", "TGIF", "DWC"}:
         entry = _f(d, "ENTRY", "REF")
         stop = _f(d, "SL")

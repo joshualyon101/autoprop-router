@@ -28,6 +28,7 @@ logger = logging.getLogger('autoprop.router')
 
 _worker_task: asyncio.Task | None = None
 _worker_wakeup: asyncio.Event | None = None
+_asw_reconcile_task: asyncio.Task | None = None
 
 
 
@@ -38,12 +39,12 @@ def _annotate_execution_result(result):
     webhook_inbox.status remains DONE when processing completed. Broker/account execution
     outcome is reported separately so a terminal all-destination failure cannot look healthy.
     """
-    if not isinstance(result, dict) or result.get('kind') != 'ENTRY':
+    if not isinstance(result, dict) or result.get('kind') not in {'ENTRY','ASW_WORKING_LIMIT'}:
         return result
     rows = result.get('results')
     if not isinstance(rows, list):
         return result
-    routed = sum(1 for r in rows if isinstance(r, dict) and r.get('status') == 'ROUTED')
+    routed = sum(1 for r in rows if isinstance(r, dict) and r.get('status') in {'ROUTED','PENDING_LIMIT'})
     errors = []
     skipped = 0
     for r in rows:
@@ -83,6 +84,12 @@ async def _process_event(event):
     rt = _runtime()
     if event.kind == 'ENTRY':
         return await rt.route_entry(event)
+    if event.kind == 'ASW_WORKING_LIMIT':
+        return await rt.route_asw_working_limit(event)
+    if event.kind == 'ASW_CANCEL_PENDING':
+        return await rt.cancel_asw_pending(event)
+    if event.kind == 'ASW_TIME_FLAT':
+        return await rt.asw_time_flat(event)
     if event.kind == 'MARKET_PULSE':
         return await rt.market_pulse(event)
     if event.kind == 'SILVER_STOP_MOVE':
@@ -144,18 +151,35 @@ async def _webhook_worker():
                 pass
 
 
+async def _asw_reconcile_loop():
+    while True:
+        try:
+            if settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
+                base = readiness(settings, _accounts())
+                if base['configuration_ready']:
+                    result = await _runtime().reconcile_asw_pending()
+                    if result.get('results'):
+                        logger.info('ASW pending reconciliation %s', result['results'])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('ASW pending reconciliation failed')
+        await asyncio.sleep(max(1.0, float(settings.ASW_PENDING_RECONCILE_SECONDS)))
+
+
 @app.on_event('startup')
 async def _start_worker():
-    global _worker_task, _worker_wakeup
+    global _worker_task, _worker_wakeup, _asw_reconcile_task
     store.recover_processing_webhooks()
     _worker_wakeup = asyncio.Event()
     _worker_task = asyncio.create_task(_webhook_worker(), name='autoprop-webhook-worker')
+    _asw_reconcile_task = asyncio.create_task(_asw_reconcile_loop(), name='autoprop-asw-reconcile')
     _worker_wakeup.set()
 
 
 @app.on_event('shutdown')
 async def _stop_worker():
-    global _worker_task
+    global _worker_task, _asw_reconcile_task
     if _worker_task is not None:
         _worker_task.cancel()
         try:
@@ -163,6 +187,13 @@ async def _stop_worker():
         except asyncio.CancelledError:
             pass
         _worker_task = None
+    if _asw_reconcile_task is not None:
+        _asw_reconcile_task.cancel()
+        try:
+            await _asw_reconcile_task
+        except asyncio.CancelledError:
+            pass
+        _asw_reconcile_task = None
 
 
 def _accounts():
@@ -216,6 +247,8 @@ def health():
         'broker_mutation_armed': base['broker_mutation_armed'],
         'registered_accounts': len(accounts),
         'active_trades': len(store.all_trades()),
+        'asw_limit_contract': 'ASW_LIMIT_V1',
+        'asw_pending_limits': len(store.all_asw_pending()),
     }
 
 
@@ -283,6 +316,8 @@ async def live_readiness(token: str):
         'warnings': warnings,
         'states': states,
         'active_trades': len(store.all_trades()),
+        'asw_limit_contract': 'ASW_LIMIT_V1',
+        'asw_pending_limits': len(store.all_asw_pending()),
     }
 
 

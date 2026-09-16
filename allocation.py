@@ -9,7 +9,7 @@ from parity import (
     challenge_risk, funded_postlock_risk, funded_prelock_risk, daily_loss_limit,
     consistency_qty, consistency_target, core_consistency_qty, core_consistency_targets,
     core_risk_multiplier, addon_risk_multiplier, engine_contract_cap, natural_qty,
-    risk_per_contract, core_split,
+    risk_per_contract, core_split, consistency_room, funded_one_contract_max_risk,
 )
 
 
@@ -170,3 +170,81 @@ def allocate(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
                       side=plan.side, qty=q, entry=plan.entry, stop=plan.stop, tp1=target,
                       tp2=None, tp1_qty=q, runner_qty=0, base_risk=base_risk,
                       effective_risk_budget=budget, risk_per_contract=rpc)
+
+
+def allocate_asw(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
+                 *, max_state_age_seconds: float = 20.0, now: datetime | None = None) -> Allocation:
+    """ASW_LIMIT_V1 destination allocation.
+
+    Challenge: exact native source plan or skip.
+    Funded: maximum safe whole native-plan multiple (1x, 2x, 3x...).
+    Personal: exact native source plan in this coordinated release.
+    Target geometry is never compressed.
+    """
+    if plan.engine != "ASW":
+        raise AllocationBlocked("allocate_asw requires ASW plan")
+    if not rule.enabled:
+        raise AllocationBlocked("account disabled")
+    if not rule.rules_verified:
+        raise AllocationBlocked("account rules not verified")
+    if not _state_fresh(state, max_state_age_seconds, now):
+        raise AllocationBlocked("account state stale")
+    if not state.daily_ledger_verified:
+        raise AllocationBlocked("New York daily realized-P&L ledger unverified")
+
+    base_risk, cushion, consistency_base_target, consistency_enabled, ceiling = _base_risk(rule, state)
+    if base_risk <= 0:
+        raise AllocationBlocked("no active risk budget")
+    if state.realized_today <= -daily_loss_limit(base_risk):
+        raise AllocationBlocked("daily loss limit reached")
+
+    native_qty = int(plan.source_qty or 0)
+    if native_qty < 1:
+        raise AllocationBlocked("ASW native quantity missing")
+    rpc = risk_per_contract(engine="ASW", entry=plan.entry, stop=plan.stop)
+    supplied_rpc = float(plan.contract_risk_dollars or 0.0)
+    if supplied_rpc <= 0 or abs(supplied_rpc - rpc) > 0.011:
+        raise AllocationBlocked(f"ASW contract-risk mismatch Pine={supplied_rpc:.2f} Router={rpc:.2f}")
+
+    cap = int(rule.max_contracts)
+    native_risk = native_qty * rpc
+    profit_pc = abs(plan.tp1 - plan.entry) * MNQ_POINT_VALUE
+    native_profit = native_qty * profit_pc
+    room = consistency_room(realized_today=state.realized_today, enabled=consistency_enabled,
+                            ceiling_fraction=ceiling, base_target=consistency_base_target)
+
+    if rule.account_type == "challenge":
+        qty = native_qty
+        if qty > cap:
+            raise AllocationBlocked("ASW exact native plan exceeds contract cap")
+        if native_risk > base_risk + 0.0001:
+            raise AllocationBlocked("ASW exact native plan exceeds Challenge risk budget")
+        if consistency_enabled and (room <= 50.0 or native_profit > room + 0.0001):
+            raise AllocationBlocked("ASW exact native plan does not fit Challenge consistency room")
+
+    elif rule.account_type == "funded":
+        units_cap = cap // native_qty
+        units_risk = int((base_risk + 0.0001) // native_risk) if native_risk > 0 else 0
+        units_consistency = (int((room + 0.0001) // native_profit)
+                             if consistency_enabled and native_profit > 0 else 10**9)
+        units = max(0, min(units_cap, units_risk, units_consistency))
+        qty = native_qty * units
+        if qty < 1:
+            raise AllocationBlocked("ASW funded whole-plan multiple returned zero")
+        survival_cap = funded_one_contract_max_risk(cushion=cushion, max_loss=rule.max_loss,
+                                                     locked=state.funded_locked)
+        if survival_cap is not None and not (qty == 1 and rpc <= survival_cap + 0.0001):
+            raise AllocationBlocked("ASW funded low-cushion survival gate")
+        if consistency_enabled and (room <= 50.0 or qty * profit_pc > room + 0.0001):
+            raise AllocationBlocked("ASW funded whole-plan multiple exceeds consistency room")
+
+    else:
+        qty = native_qty
+        if qty > cap:
+            raise AllocationBlocked("ASW native Personal plan exceeds contract cap")
+
+    return Allocation(account_id=rule.account_id, event_id=plan.event_id, engine="ASW",
+                      side=plan.side, qty=qty, entry=plan.entry, stop=plan.stop,
+                      tp1=plan.tp1, tp2=None, tp1_qty=qty, runner_qty=0,
+                      base_risk=base_risk, effective_risk_budget=base_risk,
+                      risk_per_contract=rpc)

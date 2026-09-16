@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from models import ActiveTrade, VerifiedRiskState
+from models import ActiveTrade, VerifiedRiskState, AswPending
 
 
 class Store:
@@ -30,6 +30,7 @@ class Store:
             c.execute("CREATE TABLE IF NOT EXISTS active_trades (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS org_attempts (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS risk_state (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS asw_pending (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             c.execute("""CREATE TABLE IF NOT EXISTS webhook_inbox (
                 event_key TEXT PRIMARY KEY,
                 raw TEXT NOT NULL,
@@ -78,6 +79,25 @@ class Store:
         with self.db() as c:
             row = c.execute("SELECT payload FROM org_attempts WHERE account_id=?", (account_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def save_asw_pending(self, pending: AswPending):
+        with self.db() as c:
+            c.execute("INSERT INTO asw_pending(account_id,payload) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET payload=excluded.payload",
+                      (pending.account_id, pending.model_dump_json()))
+
+    def get_asw_pending(self, account_id: str) -> AswPending | None:
+        with self.db() as c:
+            row = c.execute("SELECT payload FROM asw_pending WHERE account_id=?", (account_id,)).fetchone()
+        return AswPending.model_validate_json(row[0]) if row else None
+
+    def all_asw_pending(self) -> list[AswPending]:
+        with self.db() as c:
+            rows = c.execute("SELECT payload FROM asw_pending").fetchall()
+        return [AswPending.model_validate_json(r[0]) for r in rows]
+
+    def delete_asw_pending(self, account_id: str):
+        with self.db() as c:
+            c.execute("DELETE FROM asw_pending WHERE account_id=?", (account_id,))
 
     def save_risk_state(self, state: VerifiedRiskState):
         with self.db() as c:

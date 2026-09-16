@@ -1,2 +1,2 @@
-__version__ = '1.2.7.1-exact-parity-production-rc6-symbol-hotfix'
-VERSION = __version__  # compatibility alias for any older main.py/startup import
+__version__ = '1.2.8-exact-parity-six-engine-asw-rc1'
+VERSION = __version__

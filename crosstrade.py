@@ -213,6 +213,15 @@ class CrossTradeClient:
         normalized["instrument"] = normalize_tradovate_symbol(normalized["instrument"])
         return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=normalized)
 
+    async def order_status(self, account: str, order_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/api/tv/accounts/{account}/orders/{order_id}/status")
+
+    async def order_lifecycle(self, account: str, order_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/api/tv/accounts/{account}/orders/{order_id}/lifecycle")
+
+    async def cancel_order(self, account: str, order_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/{order_id}/cancel", json={})
+
     async def change(self, account: str, order_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("PUT", f"/v1/api/tv/accounts/{account}/orders/{order_id}/change", json=payload)
 
