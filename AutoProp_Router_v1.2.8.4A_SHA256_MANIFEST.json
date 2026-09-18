@@ -1,0 +1,16 @@
+{
+  "router_version": "1.2.8.4A-exact-parity-six-engine-silver-sb35-read-hardening-rc1",
+  "base_release": {
+    "file": "AutoProp_Router_v1.2.8.3_SILVER_SB35_STAGED_RC1_FLAT_ROOT.zip",
+    "sha256": "1b4697cbeb3b1fd3830bb65b2e8ec78fac2900309f7f5083db1781b116b00dc7"
+  },
+  "changed_files": {
+    ".env.example": "05e23f7223607f506d47450e3687b60a60c63397d17cd2ee8ff493fe1a141dac",
+    "crosstrade.py": "5dd3e327a9aa9ca89e778cc728e7a6abd1ed48e5492d588628299e3021e0c9d7",
+    "execution.py": "a2f319969b33f59df320ccb0d6b7464e8787e02de252e37fc4f3ec5e981b605b",
+    "live.py": "bb49d6ec7db9e12010742d2bfe3392f35c069f33bac3385392d31da85e1a6864",
+    "settings.py": "8c9b35732c77cb9836a65aa0b78a0dc7c977cd879e18496348e2eef7077a133f",
+    "test_transport_read_scheduler_v1_2_8_4a.py": "bda353c3654025f3f99ab9f356e402da1185b6cbca0fd6e4ac5a04bfc807a839",
+    "version.py": "bb44739e3e72726a1888ef95cd4269fe0996a0cb4ebe6e0409cfbd72f199662d"
+  }
+}

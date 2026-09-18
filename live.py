@@ -39,12 +39,19 @@ class LiveRouter:
         self.accounts = accounts
         self.store = store
         self.client = CrossTradeClient(
-            settings.CROSSTRADE_BASE_URL, settings.CROSSTRADE_TOKEN,
-            settings.REQUEST_TIMEOUT_SECONDS,
-            settings.CROSSTRADE_RATE_LIMIT_PER_MINUTE,
-            settings.CROSSTRADE_RATE_LIMIT_WINDOW_SECONDS,
-            settings.CROSSTRADE_RATE_LIMIT_MAX_RETRIES,
-            settings.CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS,
+            base_url=settings.CROSSTRADE_BASE_URL,
+            token=settings.CROSSTRADE_TOKEN,
+            timeout=settings.REQUEST_TIMEOUT_SECONDS,
+            rate_limit_per_minute=settings.CROSSTRADE_RATE_LIMIT_PER_MINUTE,
+            rate_limit_window_seconds=settings.CROSSTRADE_RATE_LIMIT_WINDOW_SECONDS,
+            rate_limit_max_retries=settings.CROSSTRADE_RATE_LIMIT_MAX_RETRIES,
+            rate_limit_fallback_seconds=settings.CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS,
+            request_min_interval_seconds=settings.CROSSTRADE_REQUEST_MIN_INTERVAL_SECONDS,
+            safe_get_max_concurrency=settings.CROSSTRADE_SAFE_GET_MAX_CONCURRENCY,
+            get_retry_max_retries=settings.CROSSTRADE_GET_RETRY_MAX_RETRIES,
+            get_retry_delay_seconds=settings.CROSSTRADE_GET_RETRY_DELAY_SECONDS,
+            get_retry_backoff_multiplier=settings.CROSSTRADE_GET_RETRY_BACKOFF_MULTIPLIER,
+            get_retry_max_delay_seconds=settings.CROSSTRADE_GET_RETRY_MAX_DELAY_SECONDS,
         )
         self.execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL or 'MNQ1!')
         self.executor = Executor(self.client,
@@ -435,8 +442,18 @@ class LiveRouter:
                 receipt = (await self.executor.place_core(rule.crosstrade_account, alloc, cid)
                            if alloc.engine == 'CORE' else
                            await self.executor.place_single(rule.crosstrade_account, alloc, cid))
-                target_ids, stop_ids = await self.executor.owned_roles(rule.crosstrade_account,
-                                                                        receipt.child_order_ids)
+                target_ids = list(receipt.target_order_ids)
+                stop_ids = list(receipt.stop_order_ids)
+                if not target_ids or not stop_ids:
+                    try:
+                        target_ids, stop_ids = await self.executor.owned_roles(
+                            rule.crosstrade_account, receipt.child_order_ids
+                        )
+                    except CrossTradeError as exc:
+                        await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                        raise ProtectionFailure(
+                            f'accepted entry role readback failed; emergency flatten sent: {exc}'
+                        ) from exc
                 if not stop_ids:
                     await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure('accepted entry has no proven owned protective stop')
@@ -447,7 +464,13 @@ class LiveRouter:
                     # canonical/planned Pine entry when the destination fill cannot be proven.
                     await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure(f'destination fill proof failed; flattened: {exc}') from exc
-                signed = await self.position_qty(rule)
+                try:
+                    signed = await self.position_qty(rule)
+                except (CrossTradeError, StateUnverified) as exc:
+                    await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
+                    raise ProtectionFailure(
+                        f'post-entry position readback failed; emergency flatten sent: {exc}'
+                    ) from exc
                 if signed == 0 or (alloc.side == 'LONG' and signed < 0) or (alloc.side == 'SHORT' and signed > 0):
                     await self.client.flatten(rule.crosstrade_account, self.execution_symbol)
                     raise ProtectionFailure(f'post-entry position mismatch netPos={signed}')

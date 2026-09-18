@@ -55,6 +55,11 @@ _RATE_TIMES: deque[float] = deque()
 _RATE_LOCK: asyncio.Lock | None = None
 _RATE_LOCK_LOOP = None
 _BLOCKED_UNTIL = 0.0
+_ACCOUNT_BLOCKED_UNTIL: dict[str, float] = {}
+_NEXT_REQUEST_AT = 0.0
+_GET_SEMAPHORE: asyncio.Semaphore | None = None
+_GET_SEMAPHORE_LOOP = None
+_GET_SEMAPHORE_CAPACITY = 0
 
 
 def _rate_lock() -> asyncio.Lock:
@@ -67,11 +72,32 @@ def _rate_lock() -> asyncio.Lock:
     return _RATE_LOCK
 
 
-async def _acquire_rate_slot(limit: int, window_seconds: float) -> None:
-    """Acquire one process-wide CrossTrade request slot without exceeding the local budget."""
-    global _BLOCKED_UNTIL
+def _account_from_path(path: str) -> str | None:
+    match = re.search(r"/accounts/([^/?]+)", str(path))
+    return match.group(1) if match else None
+
+
+def _get_semaphore(capacity: int) -> asyncio.Semaphore:
+    """Return a process-wide GET semaphore bound to the current event loop."""
+    global _GET_SEMAPHORE, _GET_SEMAPHORE_LOOP, _GET_SEMAPHORE_CAPACITY
+    loop = asyncio.get_running_loop()
+    capacity = max(1, int(capacity))
+    if (_GET_SEMAPHORE is None or _GET_SEMAPHORE_LOOP is not loop
+            or _GET_SEMAPHORE_CAPACITY != capacity):
+        _GET_SEMAPHORE = asyncio.Semaphore(capacity)
+        _GET_SEMAPHORE_LOOP = loop
+        _GET_SEMAPHORE_CAPACITY = capacity
+    return _GET_SEMAPHORE
+
+
+async def _acquire_rate_slot(limit: int, window_seconds: float, *, path: str,
+                             min_interval_seconds: float) -> None:
+    """Acquire one paced process-wide request slot and honor active penalty windows."""
+    global _BLOCKED_UNTIL, _NEXT_REQUEST_AT
     limit = max(1, int(limit))
     window_seconds = max(1.0, float(window_seconds))
+    min_interval_seconds = max(0.0, float(min_interval_seconds))
+    account = _account_from_path(path)
     while True:
         lock = _rate_lock()
         async with lock:
@@ -79,18 +105,21 @@ async def _acquire_rate_slot(limit: int, window_seconds: float) -> None:
             while _RATE_TIMES and now - _RATE_TIMES[0] >= window_seconds:
                 _RATE_TIMES.popleft()
 
-            if now < _BLOCKED_UNTIL:
-                delay = _BLOCKED_UNTIL - now
+            account_blocked_until = _ACCOUNT_BLOCKED_UNTIL.get(account, 0.0) if account else 0.0
+            blocked_until = max(_BLOCKED_UNTIL, account_blocked_until, _NEXT_REQUEST_AT)
+            if now < blocked_until:
+                delay = blocked_until - now
             elif len(_RATE_TIMES) < limit:
                 _RATE_TIMES.append(now)
+                _NEXT_REQUEST_AT = now + min_interval_seconds
                 return
             else:
                 delay = max(0.01, window_seconds - (now - _RATE_TIMES[0]))
         await asyncio.sleep(delay)
 
 
-def _explicit_rate_limit_response(response: httpx.Response) -> tuple[bool, float]:
-    """Return (is_explicit_rate_limit_rejection, retry_after_seconds)."""
+def _rate_limit_response(response: httpx.Response) -> tuple[str | None, float]:
+    """Return the explicit rejection code and broker-directed retry delay."""
     retry_after = 1.0
     raw_header = response.headers.get("Retry-After")
     if raw_header:
@@ -106,15 +135,22 @@ def _explicit_rate_limit_response(response: httpx.Response) -> tuple[bool, float
     except Exception:
         payload = None
     if payload is not None:
-        raw = payload.get("retryAfter")
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        raw = payload.get("retryAfter", details.get("retryAfter"))
         if raw is not None:
             try:
                 retry_after = max(0.0, float(raw))
             except (TypeError, ValueError):
                 pass
-        explicit = payload.get("success") is False and str(payload.get("error") or "").lower() == "rate_limited"
-        return explicit, retry_after
-    return False, retry_after
+        error = payload.get("error") or payload.get("code")
+        if isinstance(error, dict):
+            error = error.get("code") or error.get("error")
+        code = str(error or "").strip().lower()
+        if payload.get("success") is False and code in {
+            "rate_limited", "broker_rate_limited", "snapshot_refresh_pending"
+        }:
+            return code, retry_after
+    return None, retry_after
 
 
 async def _apply_global_cooldown(seconds: float) -> None:
@@ -123,6 +159,24 @@ async def _apply_global_cooldown(seconds: float) -> None:
     lock = _rate_lock()
     async with lock:
         _BLOCKED_UNTIL = max(_BLOCKED_UNTIL, time.monotonic() + seconds)
+
+
+async def _apply_account_cooldown(path: str, seconds: float) -> None:
+    account = _account_from_path(path)
+    if not account:
+        await _apply_global_cooldown(seconds)
+        return
+    seconds = max(0.0, float(seconds))
+    lock = _rate_lock()
+    async with lock:
+        _ACCOUNT_BLOCKED_UNTIL[account] = max(
+            _ACCOUNT_BLOCKED_UNTIL.get(account, 0.0), time.monotonic() + seconds
+        )
+
+
+def _get_retry_delay(base: float, multiplier: float, maximum: float, attempt: int) -> float:
+    delay = max(0.0, float(base)) * (max(1.0, float(multiplier)) ** max(0, attempt - 1))
+    return min(max(0.0, float(maximum)), delay)
 
 
 @dataclass
@@ -134,10 +188,14 @@ class CrossTradeClient:
     rate_limit_window_seconds: float = 60.0
     rate_limit_max_retries: int = 8
     rate_limit_fallback_seconds: float = 1.0
+    request_min_interval_seconds: float = 0.10
+    safe_get_max_concurrency: int = 2
     # Read-only broker calls are safe to retry on transient transport/snapshot-refresh
     # failures. Mutations retain the strict ambiguous-mutation no-resend contract.
-    get_retry_max_retries: int = 2
-    get_retry_delay_seconds: float = 0.5
+    get_retry_max_retries: int = 3
+    get_retry_delay_seconds: float = 0.75
+    get_retry_backoff_multiplier: float = 2.0
+    get_retry_max_delay_seconds: float = 5.0
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
@@ -145,52 +203,54 @@ class CrossTradeClient:
     async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         url = self.base_url.rstrip("/") + path
         method_u = method.upper()
-        attempts = 0
         get_attempts = 0
         while True:
-            await _acquire_rate_slot(self.rate_limit_per_minute, self.rate_limit_window_seconds)
+            await _acquire_rate_slot(
+                self.rate_limit_per_minute, self.rate_limit_window_seconds,
+                path=path, min_interval_seconds=self.request_min_interval_seconds,
+            )
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    r = await client.request(method_u, url, headers=self._headers(), **kwargs)
+                if method_u == "GET":
+                    async with _get_semaphore(self.safe_get_max_concurrency):
+                        async with httpx.AsyncClient(timeout=self.timeout) as client:
+                            r = await client.request(method_u, url, headers=self._headers(), **kwargs)
+                else:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        r = await client.request(method_u, url, headers=self._headers(), **kwargs)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 detail = str(e).strip() or type(e).__name__
                 if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                     raise AmbiguousMutation(f"{method_u} {path} network error: {detail}") from e
                 if method_u == "GET" and get_attempts < max(0, int(self.get_retry_max_retries)):
                     get_attempts += 1
-                    await asyncio.sleep(max(0.0, float(self.get_retry_delay_seconds)) * get_attempts)
+                    await asyncio.sleep(_get_retry_delay(
+                        self.get_retry_delay_seconds, self.get_retry_backoff_multiplier,
+                        self.get_retry_max_delay_seconds, get_attempts,
+                    ))
                     continue
                 raise CrossTradeError(f"{method_u} {path} network error after {get_attempts + 1} attempt(s): {detail}") from e
 
             if r.status_code == 429:
-                explicit, retry_after = _explicit_rate_limit_response(r)
+                rejection, retry_after = _rate_limit_response(r)
                 retry_after = retry_after if retry_after > 0 else self.rate_limit_fallback_seconds
-                # A GET-only account snapshot refresh can overlap another CrossTrade refresh.
-                # It is explicitly non-mutating and therefore safe to retry after retryAfter.
-                snapshot_refresh_pending = False
-                if method_u == "GET":
-                    try:
-                        payload = r.json()
-                        snapshot_refresh_pending = (
-                            isinstance(payload, dict)
-                            and payload.get("success") is False
-                            and str(payload.get("error") or "").lower() == "snapshot_refresh_pending"
-                        )
-                    except Exception:
-                        snapshot_refresh_pending = False
-                if snapshot_refresh_pending and get_attempts < max(0, int(self.get_retry_max_retries)):
+                cooldown = max(retry_after, _get_retry_delay(
+                    self.get_retry_delay_seconds, self.get_retry_backoff_multiplier,
+                    self.get_retry_max_delay_seconds, max(1, get_attempts + 1),
+                ))
+                if rejection in {"snapshot_refresh_pending", "broker_rate_limited"}:
+                    await _apply_account_cooldown(path, cooldown)
+                else:
+                    await _apply_global_cooldown(cooldown)
+                if (method_u == "GET"
+                        and rejection in {"snapshot_refresh_pending", "broker_rate_limited", "rate_limited"}
+                        and get_attempts < max(0, int(self.get_retry_max_retries))):
                     get_attempts += 1
-                    await _apply_global_cooldown(max(retry_after, self.get_retry_delay_seconds))
                     continue
-
-                # An explicit {success:false,error:"rate_limited"} response proves the
-                # broker rejected the request. It is therefore safe to retry even for a
-                # mutation; this is not the ambiguous PLACE case guarded above.
-                if explicit and attempts < max(0, int(self.rate_limit_max_retries)):
-                    attempts += 1
-                    await _apply_global_cooldown(max(retry_after, self.rate_limit_fallback_seconds))
-                    continue
-                raise RateLimitExceeded(f"HTTP 429: {r.text[:300]}")
+                # Mutations are never resent by the transport layer, even after an explicit
+                # 429. The caller must reconcile the broker state before any new mutation.
+                raise RateLimitExceeded(
+                    f"HTTP 429 {rejection or 'rate_limit_unknown'} after {get_attempts + 1} attempt(s): {r.text[:300]}"
+                )
 
             if r.status_code >= 500 and method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                 raise AmbiguousMutation(f"HTTP {r.status_code}")

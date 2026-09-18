@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError, normalize_tradovate_symbol
+from crosstrade import AmbiguousMutation, CrossTradeClient, CrossTradeError, RateLimitExceeded, normalize_tradovate_symbol
 from models import Allocation
 
 TICK = 0.25
@@ -149,11 +149,25 @@ def _desired_matches(o: dict[str, Any], payload: dict[str, Any]) -> bool:
     return True
 
 
+def _has_exact_geometry(o: dict[str, Any]) -> bool:
+    """True only when a readback row can prove role, quantity, and exact price."""
+    typ = str(o.get("orderType") or o.get("type") or "").lower()
+    if _qty(o) <= 0:
+        return False
+    if "stop" in typ:
+        return _price(o, "stop") is not None
+    if "limit" in typ:
+        return _price(o, "target") is not None
+    return False
+
+
 @dataclass
 class ExecutionReceipt:
     result: dict[str, Any]
     child_order_ids: list[str]
     parent_order_id: str | None = None
+    target_order_ids: list[str] = field(default_factory=list)
+    stop_order_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -168,8 +182,42 @@ class Executor:
     def _symbol(self) -> str:
         return normalize_tradovate_symbol(self.execution_symbol)
 
+    async def _flatten_unverified_entry(self, account: str, reason: str) -> None:
+        """Send exactly one fail-closed flatten; never hide an ambiguous flatten result."""
+        try:
+            await self.client.flatten(account, self._symbol())
+        except CrossTradeError as exc:
+            raise ProtectionFailure(f"{reason}; emergency flatten unconfirmed: {exc}") from exc
+        raise ProtectionFailure(f"{reason}; flattened with one emergency request")
+
     async def _raw_working_orders(self, account: str) -> list[dict[str, Any]]:
         return _data_rows(await self.client.orders(account))
+
+    async def _exact_snapshot_fallback(self, account: str, oid: str,
+                                       raw: dict[str, Any]) -> dict[str, Any] | None:
+        """Use alternate readback only when it independently exposes exact geometry.
+
+        Raw Tradovate Order rows normally do not contain OrderVersion fields, so this
+        fallback usually declines and the caller remains fail-closed. It is accepted only
+        when the account/global snapshot itself proves order type, quantity, price and ID.
+        """
+        candidates = [dict(raw)] if raw else []
+        fn = getattr(self.client, "all_orders", None)
+        if fn is not None:
+            try:
+                candidates.extend(_data_rows(await fn()))
+            except CrossTradeError:
+                pass
+        for candidate in candidates:
+            if _order_id(candidate) != str(oid) or not _has_exact_geometry(candidate):
+                continue
+            # Preserve the freshest account-scoped live/terminal status when available.
+            out = dict(candidate)
+            for key in ("ordStatus", "orderState"):
+                if raw.get(key) is not None:
+                    out[key] = raw[key]
+            return out
+        return None
 
     async def _order_snapshot(self, account: str, oid: str, raw: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Return an order row enriched with Tradovate OrderVersion fields.
@@ -180,8 +228,7 @@ class Executor:
         """
         raw = dict(raw or {})
         # Existing unit fakes / enriched callers may already provide everything needed.
-        if (raw.get("orderType") is not None and _qty(raw) > 0 and
-                (raw.get("limitPrice") is not None or raw.get("stopPrice") is not None or raw.get("price") is not None)):
+        if _has_exact_geometry(raw):
             return raw
         fn = getattr(self.client, "order_lifecycle", None)
         if fn is None:
@@ -197,10 +244,16 @@ class Executor:
             except Exception:
                 return None
             return None
-        payload = await fn(account, str(oid))
+        try:
+            payload = await fn(account, str(oid))
+        except CrossTradeError:
+            fallback = await self._exact_snapshot_fallback(account, str(oid), raw)
+            if fallback is not None:
+                return fallback
+            raise
         unavailable = {str(x) for x in (payload.get("unavailable") or [])} if isinstance(payload, dict) else set()
         if "version" in unavailable:
-            return None
+            return await self._exact_snapshot_fallback(account, str(oid), raw)
         data = payload.get("data", payload) if isinstance(payload, dict) else {}
         if not isinstance(data, dict):
             return None
@@ -313,12 +366,22 @@ class Executor:
         parent_id = _place_parent_id(result)
         response_ids = _place_child_ids(result)
         for _ in range(self.bracket_confirm_retries):
-            orders, owned = await self._discover_owned_children(account, before_ids, response_ids)
+            try:
+                orders, owned = await self._discover_owned_children(account, before_ids, response_ids)
+            except CrossTradeError as exc:
+                await self._flatten_unverified_entry(
+                    account, f"single-target exact readback unavailable after accepted PLACE: {exc}"
+                )
             if owned and verify_single_bracket(orders, alloc, owned):
-                return ExecutionReceipt(result, sorted(owned), parent_id)
+                targets, stops = classify_children(_owned(orders, owned))
+                target_ids = [_order_id(o) for o in targets if _order_id(o)]
+                stop_ids = [_order_id(o) for o in stops if _order_id(o)]
+                return ExecutionReceipt(result, sorted(owned), parent_id,
+                                        sorted(target_ids), sorted(stop_ids))
             await asyncio.sleep(self.bracket_confirm_delay)
-        await self.client.flatten(account, self._symbol())
-        raise ProtectionFailure("single-target protective bracket failed owned exact readback; flattened")
+        await self._flatten_unverified_entry(
+            account, "single-target protective bracket failed owned exact readback"
+        )
 
     async def place_asw_limit(self, account: str, alloc: Allocation, custom_order_id: str,
                               *, expiry_time_ms: int, now_ms: int) -> ExecutionReceipt:
@@ -399,8 +462,16 @@ class Executor:
         parent_id = _place_parent_id(result)
         response_ids = _place_child_ids(result)
         # CRITICAL RC2 call site: normalization is mandatory in the direct production path.
-        owned = await self._normalize_core_multibracket(account, alloc, before_ids, response_ids)
-        return ExecutionReceipt(result, sorted(owned), parent_id)
+        try:
+            owned, target_ids, stop_ids = await self._normalize_core_multibracket(
+                account, alloc, before_ids, response_ids
+            )
+        except CrossTradeError as exc:
+            await self._flatten_unverified_entry(
+                account, f"Core exact readback unavailable after accepted PLACE: {exc}"
+            )
+        return ExecutionReceipt(result, sorted(owned), parent_id,
+                                sorted(target_ids), sorted(stop_ids))
 
     async def _read_order(self, account: str, oid: str) -> dict[str, Any] | None:
         try:
@@ -420,8 +491,15 @@ class Executor:
                 current = await self._read_order(account, oid)
                 if current is not None and _desired_matches(current, payload):
                     return
-            except CrossTradeError as e:
+            except RateLimitExceeded as e:
+                # The transport never resends a rate-limited mutation. Reconcile first;
+                # only the outer exact-change loop may issue another idempotent CHANGE.
                 last = e
+                current = await self._read_order(account, oid)
+                if current is not None and _desired_matches(current, payload):
+                    return
+            except CrossTradeError as e:
+                raise ProtectionFailure(f"definitive child {oid} change failure: {e}") from e
             else:
                 current = await self._read_order(account, oid)
                 if current is not None and _desired_matches(current, payload):
@@ -431,7 +509,7 @@ class Executor:
         raise ProtectionFailure(f"could not normalize child {oid}: {last}")
 
     async def _normalize_core_multibracket(self, account: str, alloc: Allocation,
-                                           before_ids: set[str], response_ids: set[str]) -> set[str]:
+                                           before_ids: set[str], response_ids: set[str]) -> tuple[set[str], list[str], list[str]]:
         """Normalize only proven children to exact absolute prices, then read back.
 
         Ownership comes from broker-returned child IDs when available, otherwise from the
@@ -474,11 +552,17 @@ class Executor:
                         if snap is not None and self._is_live_snapshot(snap):
                             check.append(snap)
                     if verify_core_bracket(check, alloc, owned_ids):
-                        return owned_ids
+                        verified_targets, verified_stops = classify_children(_owned(check, owned_ids))
+                        return (
+                            owned_ids,
+                            [_order_id(o) for o in verified_targets if _order_id(o)],
+                            [_order_id(o) for o in verified_stops if _order_id(o)],
+                        )
                     await asyncio.sleep(self.bracket_confirm_delay)
             await asyncio.sleep(self.bracket_confirm_delay)
-        await self.client.flatten(account, self._symbol())
-        raise ProtectionFailure("Core owned bracket normalization/readback failed; flattened")
+        await self._flatten_unverified_entry(
+            account, "Core owned bracket normalization/readback failed"
+        )
 
 
     async def working_orders(self, account: str) -> list[dict[str, Any]]:
