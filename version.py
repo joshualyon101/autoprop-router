@@ -1,2 +1,2 @@
-__version__ = '1.2.8.4A-exact-parity-six-engine-silver-sb35-read-hardening-rc1'
+__version__ = '1.2.8.5-exact-parity-low-latency-fanout-rc1'
 VERSION = __version__

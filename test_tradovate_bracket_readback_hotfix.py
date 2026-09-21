@@ -1,6 +1,6 @@
 import pytest
 
-from execution import Executor, verify_single_bracket, verify_core_bracket
+from execution import Executor, ProtectionFailure, verify_single_bracket, verify_core_bracket
 from models import Allocation
 
 
@@ -28,6 +28,8 @@ class RealisticTradovateClient:
         self.rows = {}
         self.versions = {}
         self.commands = {}
+        self.reports = {}
+        self.next_command_id = 1000
         self.flatten_calls = 0
         self.change_calls = []
         self.last_payload = None
@@ -51,7 +53,7 @@ class RealisticTradovateClient:
             'order':dict(self.rows[oid]),
             'version':dict(self.versions[oid]),
             'commands':list(self.commands.get(oid,[])),
-            'reports':[],
+            'reports':list(self.reports.get(oid,[])),
         }}
 
     async def place(self, account, payload):
@@ -94,6 +96,16 @@ class RealisticTradovateClient:
         if 'orderType' in payload: v['orderType']=str(payload['orderType']).capitalize()
         if 'limitPrice' in payload: v['price']=float(payload['limitPrice'])
         if 'stopPrice' in payload: v['stopPrice']=float(payload['stopPrice'])
+        self.next_command_id += 1
+        command_id = self.next_command_id
+        self.commands.setdefault(oid, []).append({
+            'id':command_id, 'orderId':oid, 'commandType':'Modify',
+            'commandStatus':'Replaced',
+        })
+        self.reports.setdefault(oid, []).append({
+            'commandId':command_id, 'commandStatus':'Replaced',
+            'rejectReason':'Success', 'ordStatus':self.rows[oid]['ordStatus'],
+        })
         return {'ok':True}
 
     async def flatten(self, account, instrument='MNQ1!'):
@@ -146,3 +158,147 @@ async def test_all_orders_identity_envelope_is_flattened_for_reconciliation_cand
     c.commands['p']=[{'commandType':'New','clOrdId':'CID-AMB'}]
     e=Executor(c)
     assert await e._reconcile_custom_order('acct','CID-AMB')=='p'
+
+
+class ChangeLifecycleClient:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.change_calls = 0
+        self.lifecycle_calls = 0
+        self.version = {
+            'orderId':'s1', 'orderQty':2, 'orderType':'Stop', 'stopPrice':95.0,
+        }
+        self.commands = [{
+            'id':10, 'orderId':'s1', 'commandType':'Modify',
+            'commandStatus':'Replaced',
+        }]
+        self.reports = [{
+            'commandId':10, 'commandStatus':'Replaced',
+            'rejectReason':'Success', 'ordStatus':'Working',
+        }]
+
+    async def order_lifecycle(self, account, oid):
+        self.lifecycle_calls += 1
+        payload = {'success':True, 'data':{
+            'order':{'id':'s1', 'ordStatus':'Working'},
+            'version':dict(self.version),
+            'commands':[dict(x) for x in self.commands],
+            'reports':[dict(x) for x in self.reports],
+        }}
+        if self.outcome == 'unavailable' and self.change_calls:
+            payload['partial'] = True
+            payload['unavailable'] = ['reports:11']
+        return payload
+
+    async def change(self, account, oid, payload):
+        self.change_calls += 1
+        self.version['orderQty'] = int(payload['qty'])
+        self.version['orderType'] = 'Stop'
+        self.version['stopPrice'] = float(payload['stopPrice'])
+        if self.outcome == 'accepted':
+            command_status = 'Replaced'
+            reports = [{
+                'commandId':11, 'commandStatus':'Replaced',
+                'rejectReason':'Success', 'ordStatus':'Working',
+            }]
+        elif self.outcome == 'rejected':
+            # The version already contains the requested price, but the command report is
+            # authoritative and says the broker rejected that modification.
+            command_status = 'RiskPassed'
+            reports = [{
+                'commandId':11, 'commandStatus':'ExecutionRejected',
+                'rejectReason':'InvalidPrice', 'ordStatus':'Working',
+            }]
+        elif self.outcome == 'pending_success':
+            command_status = 'Replaced'
+            reports = [{
+                'commandId':11, 'commandStatus':'PendingExecution',
+                'rejectReason':'Success', 'ordStatus':'Working',
+            }]
+        elif self.outcome == 'replaced_blank':
+            command_status = 'Replaced'
+            reports = [{
+                'commandId':11, 'commandStatus':'Replaced',
+                'rejectReason':'', 'ordStatus':'Working',
+            }]
+        else:
+            command_status = 'PendingExecution' if self.outcome == 'pending' else 'Replaced'
+            reports = []
+        self.commands.append({
+            'id':11, 'orderId':'s1', 'commandType':'Modify',
+            'commandStatus':command_status,
+        })
+        self.reports.extend(reports)
+        return {'success':True, 'response':{}}
+
+
+@pytest.mark.asyncio
+async def test_change_requires_new_modify_and_correlated_success_report():
+    client = ChangeLifecycleClient('accepted')
+    executor = Executor(client, change_retries=2, change_delay=0)
+
+    await executor._change_exact(
+        'acct', 's1', {'qty':2, 'orderType':'stop', 'stopPrice':96.0}
+    )
+
+    assert client.change_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_modify_report_overrides_matching_order_version():
+    client = ChangeLifecycleClient('rejected')
+    executor = Executor(client, change_retries=2, change_delay=0)
+
+    with pytest.raises(ProtectionFailure, match='InvalidPrice|invalidprice'):
+        await executor._change_exact(
+            'acct', 's1', {'qty':2, 'orderType':'stop', 'stopPrice':96.0}
+        )
+
+    assert client.version['stopPrice'] == 96.0
+    assert client.change_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'outcome',
+    ['pending', 'pending_success', 'replaced_blank', 'missing', 'unavailable'],
+)
+async def test_unconfirmed_modify_is_polled_without_resend(outcome):
+    client = ChangeLifecycleClient(outcome)
+    executor = Executor(client, change_retries=3, change_delay=0)
+
+    with pytest.raises(ProtectionFailure, match='outcome unconfirmed; no resend'):
+        await executor._change_exact(
+            'acct', 's1', {'qty':2, 'orderType':'stop', 'stopPrice':96.0}
+        )
+
+    assert client.change_calls == 1
+    assert client.lifecycle_calls == 4  # one baseline read plus three confirmation polls
+
+
+class ResolvingChangeLifecycleClient(ChangeLifecycleClient):
+    async def order_lifecycle(self, account, oid):
+        # Baseline is call 1 and the first post-CHANGE observation is call 2. Resolve only
+        # before the second post-CHANGE poll so the test proves that polling—not resend—wins.
+        if self.change_calls and self.lifecycle_calls >= 2:
+            self.commands[-1]['commandStatus'] = 'Replaced'
+            if not any(str(r.get('commandId')) == '11' for r in self.reports):
+                self.reports.append({
+                    'commandId':11, 'commandStatus':'Replaced',
+                    'rejectReason':'Success', 'ordStatus':'Working',
+                })
+        return await super().order_lifecycle(account, oid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('initial', ['pending', 'missing'])
+async def test_change_waits_for_final_report_without_resending(initial):
+    client = ResolvingChangeLifecycleClient(initial)
+    executor = Executor(client, change_retries=3, change_delay=0)
+
+    await executor._change_exact(
+        'acct', 's1', {'qty':2, 'orderType':'stop', 'stopPrice':96.0}
+    )
+
+    assert client.change_calls == 1
+    assert client.lifecycle_calls == 3  # baseline, pending/missing, final Replaced+Success

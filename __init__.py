@@ -1,1 +1,1 @@
-__version__ = "1.2.3-exact-parity-production-rc2"
+__version__ = "1.2.8.5-exact-parity-low-latency-fanout-rc1"

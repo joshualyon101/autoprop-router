@@ -7,6 +7,8 @@ from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:
     problems: list[str] = []
     warnings: list[str] = []
+    if str(settings.AUTOPROP_EXECUTION_MODE).strip().lower() != 'live':
+        problems.append('execution mode must be live')
     if settings.AUTOPROP_MANAGEMENT_MODE != 'exact_formula_parity':
         problems.append('management mode must be exact_formula_parity')
     if settings.NATIVE_ATM_BREAKEVEN_AFTER_TP1:

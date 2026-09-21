@@ -16,6 +16,7 @@ from live import LiveRouter
 from models import AccountRule, AccountState, Allocation
 from readiness import readiness
 from settings import Settings
+from store import Store
 
 
 def _alloc(engine: str, qty: int = 3) -> Allocation:
@@ -126,7 +127,8 @@ class ExecutorClient:
             {"id": "t1", "orderType": "Limit", "qty": payload["qty"], "limitPrice": payload["takeProfit"]},
             {"id": "s1", "orderType": "Stop", "qty": payload["qty"], "stopPrice": payload["stopLoss"]},
         ])
-        return {"response": {"orderId": "p", "osoChildIds": ["t1", "s1"]}}
+        return {"response": {"orderId": "p", "oso1Id": "t1", "oso2Id": "s1",
+                             "osoChildIds": ["t1", "s1"]}}
 
     async def change(self, account, oid, payload):
         for row in self.rows:
@@ -188,10 +190,16 @@ def _rule(i: int) -> AccountRule:
 
 
 @pytest.mark.asyncio
-async def test_definitive_symbol_error_aborts_eight_account_fanout_after_first_broker_attempt():
+async def test_definitive_symbol_error_aborts_eight_account_fanout_after_first_broker_attempt(tmp_path):
     router = LiveRouter.__new__(LiveRouter)
     router.accounts = [_rule(i) for i in range(8)]
-    router.settings = SimpleNamespace(MAX_STATE_AGE_SECONDS=20)
+    router.settings = SimpleNamespace(
+        MAX_STATE_AGE_SECONDS=20,
+        ENTRY_SIGNAL_MAX_AGE_SECONDS=8,
+        # Serialize this compatibility test so the first definitive contract
+        # rejection closes admission before another mutation can start.
+        ENTRY_FANOUT_MAX_CONCURRENCY=1,
+    )
 
     async def gate(rule):
         return None
@@ -205,18 +213,12 @@ async def test_definitive_symbol_error_aborts_eight_account_fanout_after_first_b
     router.entry_gate = gate
     router.state_for = state_for
 
-    class Store:
-        def claim_event(self, key):
-            return True
-        def get_org_attempt(self, account_id):
-            return None
-
-    router.store = Store()
+    router.store = Store(str(tmp_path / "symbol-fanout.sqlite"))
 
     class FailingExecutor:
         def __init__(self):
             self.calls = 0
-        async def place_single(self, account, alloc, custom_order_id):
+        async def place_single(self, account, alloc, custom_order_id, **kwargs):
             self.calls += 1
             raise InstrumentContractError("HTTP 400: Cannot translate execution symbol to a Tradovate symbol")
 
@@ -228,9 +230,10 @@ async def test_definitive_symbol_error_aborts_eight_account_fanout_after_first_b
 
     assert router.executor.calls == 1
     assert len(out["results"]) == 8
-    assert all(row["status"] == "ERROR" for row in out["results"])
+    assert out["results"][0]["status"] == "ERROR"
+    assert all(row["status"] == "ABORTED" for row in out["results"][1:])
     assert "Cannot translate" in out["global_execution_error"]
-    assert "fanout aborted before broker mutation" in out["results"][1]["reason"]
+    assert "admission closed before PLACE" in out["results"][1]["reason"]
 
 
 def test_execution_summary_flags_legacy_eight_account_http400_as_terminal_execution_failure():

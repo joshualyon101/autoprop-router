@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     CROSSTRADE_RATE_LIMIT_MAX_RETRIES: int = 8
     CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS: float = 1.0
     CROSSTRADE_REQUEST_MIN_INTERVAL_SECONDS: float = 0.10
+    # Broker reads stay paced, while one coordinated eight-account entry may use the
+    # documented burst allowance. Mutations still pass through the rolling-minute cap.
+    CROSSTRADE_MUTATION_MIN_INTERVAL_SECONDS: float = 0.02
     CROSSTRADE_SAFE_GET_MAX_CONCURRENCY: int = 2
     CROSSTRADE_GET_RETRY_MAX_RETRIES: int = 3
     CROSSTRADE_GET_RETRY_DELAY_SECONDS: float = 0.75
@@ -41,6 +44,17 @@ class Settings(BaseSettings):
     MANAGEMENT_CHANGE_RETRY_DELAY_SECONDS: float = 0.25
     BRACKET_CONFIRM_RETRIES: int = 12
     BRACKET_CONFIRM_RETRY_DELAY_SECONDS: float = 0.25
+    # An ENTRY is admitted only while it is fresh from Router ingress. Account
+    # preflight is performed as a batch, followed by a tight broker mutation wave.
+    ENTRY_SIGNAL_MAX_AGE_SECONDS: float = 8.0
+    ENTRY_PREFLIGHT_TIMEOUT_SECONDS: float = 5.0
+    ENTRY_FANOUT_MAX_CONCURRENCY: int = 8
+    ENTRY_RECONCILE_TIMEOUT_SECONDS: float = 30.0
+    ENTRY_RECONCILE_BASE_DELAY_SECONDS: float = 0.75
+    ENTRY_RECONCILE_MAX_DELAY_SECONDS: float = 5.0
+    ENTRY_RECONCILE_LOOP_SECONDS: float = 0.50
+    ENTRY_STATE_CACHE_MAX_AGE_SECONDS: float = 20.0
+    STARTUP_STATE_WARM_TIMEOUT_SECONDS: float = 20.0
     AUTOPROP_LIVE_ARM: str = ''
     AUTOPROP_FULL_SCALE_ARM: str = ''
     TRADINGVIEW_ALERT_CONTRACT_VERIFIED: bool = False

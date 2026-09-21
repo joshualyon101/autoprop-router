@@ -115,7 +115,8 @@ from models import AswPending
 
 class RouteExecutor:
     def __init__(self): self.calls=[]
-    async def place_asw_limit(self, account, alloc, custom_order_id, *, expiry_time_ms, now_ms):
+    async def place_asw_limit(self, account, alloc, custom_order_id, *, expiry_time_ms,
+                              now_ms, **kwargs):
         from execution import ExecutionReceipt
         self.calls.append((account,alloc,custom_order_id,expiry_time_ms,now_ms))
         return ExecutionReceipt({'ok':True},['t1','s1'],'p1')
@@ -159,8 +160,12 @@ class ReconcileClient:
             ]}
         return {'data':[]}
     async def fills_order(self,oid):
-        return {'data':[{'id':'f1','qty':abs(self.pos) or 2,'price':20000.0}]}
-    async def position(self,account,instrument='MNQ1!'): return {'data':{'netPos':self.pos}}
+        return {'data':[{'id':'f1','qty':abs(self.pos) or 2,'price':20000.0,
+                         'instrument':'MNQZ6','contractId':991}]}
+    async def positions(self,account):
+        return {'data':([{'netPos':self.pos,'contractId':991}] if self.pos else [])}
+    async def position(self,account,instrument='MNQ1!'):
+        raise AssertionError('singular position endpoint must never be used')
     async def cancel_order(self,account,oid): self.cancel_calls.append(oid); self.status='Canceled'; return {'ok':True}
     async def flatten(self,account,instrument='MNQ1!'): self.flatten_calls.append((account,instrument)); self.pos=0; return {'ok':True}
 

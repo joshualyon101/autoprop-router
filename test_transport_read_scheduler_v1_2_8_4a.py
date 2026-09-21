@@ -47,11 +47,15 @@ async def test_broker_rate_limited_get_honors_retry_after_then_succeeds(monkeypa
                 })
             return _Resp(200, {"ok": True})
 
-    async def record_account_cooldown(path, seconds):
-        cooldowns.append((path, seconds))
+    async def record_global_cooldown(seconds):
+        cooldowns.append(seconds)
+
+    async def unexpected_account_cooldown(path, seconds):
+        raise AssertionError("broker cooldown must cover the whole linked identity")
 
     monkeypatch.setattr(ct.httpx, "AsyncClient", Session)
-    monkeypatch.setattr(ct, "_apply_account_cooldown", record_account_cooldown)
+    monkeypatch.setattr(ct, "_apply_global_cooldown", record_global_cooldown)
+    monkeypatch.setattr(ct, "_apply_account_cooldown", unexpected_account_cooldown)
     client = ct.CrossTradeClient(
         "https://example.invalid", "x", rate_limit_per_minute=999,
         request_min_interval_seconds=0, get_retry_max_retries=2,
@@ -62,7 +66,7 @@ async def test_broker_rate_limited_get_honors_retry_after_then_succeeds(monkeypa
 
     assert result == {"ok": True}
     assert calls == 2
-    assert cooldowns == [("/v1/api/tv/accounts/A/orders/1/lifecycle", 5.0)]
+    assert cooldowns == [5.0]
 
 
 @pytest.mark.asyncio
@@ -89,9 +93,12 @@ async def test_broker_rate_limited_place_is_never_resent(monkeypatch):
             })
 
     monkeypatch.setattr(ct.httpx, "AsyncClient", Session)
-    async def no_wait_cooldown(path, seconds):
+    async def no_wait_cooldown(seconds):
         return None
-    monkeypatch.setattr(ct, "_apply_account_cooldown", no_wait_cooldown)
+    async def unexpected_account_cooldown(path, seconds):
+        raise AssertionError("broker cooldown must not be account-scoped")
+    monkeypatch.setattr(ct, "_apply_global_cooldown", no_wait_cooldown)
+    monkeypatch.setattr(ct, "_apply_account_cooldown", unexpected_account_cooldown)
     client = ct.CrossTradeClient(
         "https://example.invalid", "x", rate_limit_per_minute=999,
         request_min_interval_seconds=0,
@@ -169,7 +176,7 @@ async def test_lifecycle_failure_uses_only_exact_alternate_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_accepted_place_readback_failure_flattens_once_without_resending_place():
+async def test_accepted_place_missing_role_labels_flattens_once_without_resending_place():
     class Client:
         def __init__(self):
             self.place_calls = 0
@@ -186,11 +193,9 @@ async def test_accepted_place_readback_failure_flattens_once_without_resending_p
         async def all_orders(self):
             return {"data": []}
 
-        async def order_lifecycle(self, account, oid):
-            raise ct.CrossTradeError("lifecycle exhausted")
-
         async def place(self, account, payload):
             self.place_calls += 1
+            # A generic child list does not prove which child is the stop.
             return {"response": {"orderId": "p1", "osoChildIds": ["t1", "s1"]}}
 
         async def flatten(self, account, instrument):
@@ -231,7 +236,8 @@ async def test_verified_receipt_carries_roles_without_second_lifecycle_pass():
 
         async def place(self, account, payload):
             self.placed = True
-            return {"response": {"orderId": "p1", "osoChildIds": ["t1", "s1"]}}
+            return {"response": {"orderId": "p1", "oso1Id": "t1", "oso2Id": "s1",
+                                 "osoChildIds": ["t1", "s1"]}}
 
         async def flatten(self, account, instrument):
             raise AssertionError("valid bracket must not flatten")
@@ -243,4 +249,4 @@ async def test_verified_receipt_carries_roles_without_second_lifecycle_pass():
 
     assert receipt.target_order_ids == ["t1"]
     assert receipt.stop_order_ids == ["s1"]
-    assert client.lifecycle_calls == 2
+    assert client.lifecycle_calls == 0

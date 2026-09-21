@@ -14,6 +14,19 @@ class ProtectionFailure(RuntimeError):
     pass
 
 
+class AcceptedOrderError(ProtectionFailure):
+    """A PLACE may be live, but its ownership/protection receipt is incomplete.
+
+    The live router persists ``receipt`` before claiming the one allowed emergency
+    flatten. Direct Executor callers retain the historical fail-closed behavior through
+    the ``place_*`` compatibility wrappers.
+    """
+
+    def __init__(self, message: str, receipt: "ExecutionReceipt"):
+        super().__init__(message)
+        self.receipt = receipt
+
+
 def tick_equal(a: float | None, b: float | None, tick: float = TICK) -> bool:
     if a is None or b is None:
         return False
@@ -122,13 +135,37 @@ def _place_child_ids(result: dict[str, Any]) -> set[str]:
     return out
 
 
+def _place_oso_roles(result: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return (target_id, stop_id) from the documented Tradovate OSO response.
+
+    CrossTrade sends take-profit first and stop-loss second, exposing those identities
+    as oso1Id and oso2Id. This acceptance contract is both faster and stronger than
+    rediscovering unrelated working orders by price after submission.
+    """
+    containers = [result]
+    for key in ("response", "data"):
+        if isinstance(result.get(key), dict):
+            containers.append(result[key])
+    partial: tuple[str | None, str | None] = (None, None)
+    for container in containers:
+        target = container.get("oso1Id")
+        stop = container.get("oso2Id")
+        if target is not None and stop is not None:
+            return (str(target) if target is not None else None,
+                    str(stop) if stop is not None else None)
+        if target is not None or stop is not None:
+            partial = (str(target) if target is not None else None,
+                       str(stop) if stop is not None else None)
+    return partial
+
+
 def _place_parent_id(result: dict[str, Any]) -> str | None:
     containers = [result]
     for key in ("response", "data"):
         if isinstance(result.get(key), dict):
             containers.append(result[key])
     for c in containers:
-        v = c.get("orderId") or c.get("id")
+        v = c.get("orderId") or c.get("orderStrategyId") or c.get("id")
         if v is not None:
             return str(v)
     return None
@@ -161,6 +198,114 @@ def _has_exact_geometry(o: dict[str, Any]) -> bool:
     return False
 
 
+def _lifecycle_rows(snapshot: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    rows = snapshot.get(key)
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _command_id(row: dict[str, Any]) -> str:
+    value = row.get("id")
+    return "" if value is None else str(value)
+
+
+def _modify_command_ids(snapshot: dict[str, Any]) -> set[str]:
+    return {
+        _command_id(command)
+        for command in _lifecycle_rows(snapshot, "_lifecycle_commands")
+        if str(command.get("commandType") or "").strip().lower() == "modify"
+        and _command_id(command)
+    }
+
+
+def _command_sort_key(command: dict[str, Any]) -> tuple[int, int, str, str]:
+    raw_id = _command_id(command)
+    try:
+        numeric_id = int(raw_id)
+    except (TypeError, ValueError):
+        numeric_id = -1
+    return (
+        1 if numeric_id >= 0 else 0,
+        numeric_id,
+        str(command.get("timestamp") or ""),
+        raw_id,
+    )
+
+
+def _change_confirmation(
+    snapshot: dict[str, Any], baseline_modify_ids: set[str], desired: dict[str, Any]
+) -> tuple[str, str, set[str]]:
+    """Classify broker lifecycle evidence for one newly submitted CHANGE.
+
+    Tradovate may create an OrderVersion before rejecting the command that requested it,
+    so matching geometry alone is never confirmation. A successful result requires a
+    *new* Modify command, its corresponding non-rejected final report, a live order, and
+    the desired geometry. ``pending`` means the caller must wait, not resend blindly.
+    """
+    unavailable = {
+        str(value) for value in snapshot.get("_lifecycle_unavailable", [])
+    }
+    if "commands" in unavailable:
+        return "pending", "lifecycle commands unavailable", set()
+
+    commands = [
+        command
+        for command in _lifecycle_rows(snapshot, "_lifecycle_commands")
+        if str(command.get("commandType") or "").strip().lower() == "modify"
+        and _command_id(command) not in baseline_modify_ids
+    ]
+    observed_ids = {_command_id(command) for command in commands if _command_id(command)}
+    if not commands:
+        return "pending", "new Modify command not visible", observed_ids
+
+    command = max(commands, key=_command_sort_key)
+    command_id = _command_id(command)
+    command_status = str(command.get("commandStatus") or "").strip().lower()
+    rejected_statuses = {
+        "riskrejected", "executionrejected", "executionstopped",
+    }
+    if command_status in rejected_statuses:
+        return "rejected", f"Modify command {command_id} ended {command_status}", observed_ids
+
+    if "reports" in unavailable or f"reports:{command_id}" in unavailable:
+        return "pending", f"reports for Modify command {command_id} unavailable", observed_ids
+    reports = [
+        report
+        for report in _lifecycle_rows(snapshot, "_lifecycle_reports")
+        if str(report.get("commandId") or "") == command_id
+    ]
+    if not reports:
+        return "pending", f"report for Modify command {command_id} not visible", observed_ids
+
+    positive_report = False
+    for report in reports:
+        report_status = str(report.get("commandStatus") or "").strip().lower()
+        reject_reason = str(report.get("rejectReason") or "").strip().lower()
+        if report_status in rejected_statuses or reject_reason not in {"", "success"}:
+            detail = reject_reason or report_status or "rejected"
+            return "rejected", f"Modify command {command_id} rejected: {detail}", observed_ids
+        report_order_status = str(report.get("ordStatus") or "").strip().lower()
+        if (report_status == "replaced" and reject_reason == "success"
+                and report_order_status in {"working", "suspended"}):
+            positive_report = True
+
+    if command_status != "replaced" or not positive_report:
+        return "pending", f"Modify command {command_id} has no final Replaced report", observed_ids
+
+    order_status = str(
+        snapshot.get("ordStatus") or snapshot.get("orderState") or ""
+    ).strip().lower()
+    if order_status not in {"working", "suspended"}:
+        return "rejected", (
+            f"Modify command {command_id} ended with non-live order status "
+            f"{order_status or 'unknown'}"
+        ), observed_ids
+    if not _desired_matches(snapshot, desired):
+        return "pending", f"Modify command {command_id} geometry not yet current", observed_ids
+    return "confirmed", f"Modify command {command_id} replaced", observed_ids
+
+
 @dataclass
 class ExecutionReceipt:
     result: dict[str, Any]
@@ -181,6 +326,17 @@ class Executor:
 
     def _symbol(self) -> str:
         return normalize_tradovate_symbol(self.execution_symbol)
+
+    async def _place(self, account: str, payload: dict[str, Any], *,
+                     deadline_epoch: float | None = None, admission_guard=None) -> dict[str, Any]:
+        # Keep compatibility with test doubles and alternate clients that expose the
+        # original two-argument method while production receives the final admission guard.
+        if deadline_epoch is None and admission_guard is None:
+            return await self.client.place(account, payload)
+        return await self.client.place(
+            account, payload, deadline_epoch=deadline_epoch,
+            admission_guard=admission_guard,
+        )
 
     async def _flatten_unverified_entry(self, account: str, reason: str) -> None:
         """Send exactly one fail-closed flatten; never hide an ambiguous flatten result."""
@@ -277,6 +433,13 @@ class Executor:
             "ordStatus": order.get("ordStatus") or raw.get("ordStatus"),
         }
         commands = data.get("commands") if isinstance(data.get("commands"), list) else []
+        reports = data.get("reports") if isinstance(data.get("reports"), list) else []
+        # Preserve lifecycle evidence alongside normalized geometry. CHANGE confirmation
+        # must correlate a newly-created Modify command with its reports; OrderVersion
+        # values alone can describe a broker-rejected modification.
+        out["_lifecycle_commands"] = [x for x in commands if isinstance(x, dict)]
+        out["_lifecycle_reports"] = [x for x in reports if isinstance(x, dict)]
+        out["_lifecycle_unavailable"] = sorted(unavailable)
         for command in commands:
             if not isinstance(command, dict):
                 continue
@@ -348,43 +511,65 @@ class Executor:
         # and the caller retries rather than widening ownership.
         return rows, owned
 
-    async def place_single(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
-        before = await self._raw_working_orders(account)
-        before_ids = {_order_id(o) for o in before if _order_id(o)}
+    async def submit_single(self, account: str, alloc: Allocation, custom_order_id: str, *,
+                            deadline_epoch: float | None = None,
+                            admission_guard=None) -> ExecutionReceipt:
         payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
                    "takeProfit": alloc.tp1, "stopLoss": alloc.stop,
+                   "requireMarketPosition": "flat", "maxPositions": 1,
                    "text": f"AutoProp {alloc.engine} {alloc.event_id}"}
+        # No reads belong in the submit wave. An ambiguous result remains durably
+        # SUBMITTING and is reconciled by LiveRouter; it is never resent here.
+        result = await self._place(
+            account, payload, deadline_epoch=deadline_epoch,
+            admission_guard=admission_guard,
+        )
+        parent_id = _place_parent_id(result)
+        target_id, stop_id = _place_oso_roles(result)
+        response_ids = _place_child_ids(result)
+        expected_ids = {x for x in (target_id, stop_id) if x}
+        if (not parent_id or not target_id or not stop_id
+                or len({parent_id, target_id, stop_id}) != 3
+                or response_ids != expected_ids):
+            receipt = ExecutionReceipt(
+                result, sorted(response_ids), parent_id,
+                [target_id] if target_id else [], [stop_id] if stop_id else [],
+            )
+            raise AcceptedOrderError(
+                "accepted native OSO response missing exact parent/target/stop identities",
+                receipt,
+            )
+        # CrossTrade documents that this one accepted mutation created a Tradovate-hosted
+        # OCO at the exact absolute takeProfit/stopLoss values sent above. Persist the role
+        # identities immediately; fill/position reconciliation is deliberately asynchronous.
+        return ExecutionReceipt(result, sorted(expected_ids), parent_id,
+                                [target_id], [stop_id])
+
+    async def place_single(self, account: str, alloc: Allocation, custom_order_id: str, *,
+                           deadline_epoch: float | None = None,
+                           admission_guard=None) -> ExecutionReceipt:
+        """Compatibility wrapper for direct callers; LiveRouter uses ``submit_single``."""
         try:
-            result = await self.client.place(account, payload)
+            return await self.submit_single(
+                account, alloc, custom_order_id, deadline_epoch=deadline_epoch,
+                admission_guard=admission_guard,
+            )
         except AmbiguousMutation:
-            # NEVER blindly resend an ambiguous PLACE.
+            # Direct-call compatibility: reconcile once by the caller ID, never resend.
             parent_id = await self._reconcile_custom_order(account, custom_order_id)
             if not parent_id:
                 raise ProtectionFailure("ambiguous PLACE could not be reconciled; no resend")
-            result = {"reconciled": True, "response": {"orderId": parent_id}}
-        parent_id = _place_parent_id(result)
-        response_ids = _place_child_ids(result)
-        for _ in range(self.bracket_confirm_retries):
-            try:
-                orders, owned = await self._discover_owned_children(account, before_ids, response_ids)
-            except CrossTradeError as exc:
-                await self._flatten_unverified_entry(
-                    account, f"single-target exact readback unavailable after accepted PLACE: {exc}"
-                )
-            if owned and verify_single_bracket(orders, alloc, owned):
-                targets, stops = classify_children(_owned(orders, owned))
-                target_ids = [_order_id(o) for o in targets if _order_id(o)]
-                stop_ids = [_order_id(o) for o in stops if _order_id(o)]
-                return ExecutionReceipt(result, sorted(owned), parent_id,
-                                        sorted(target_ids), sorted(stop_ids))
-            await asyncio.sleep(self.bracket_confirm_delay)
-        await self._flatten_unverified_entry(
-            account, "single-target protective bracket failed owned exact readback"
-        )
+            await self._flatten_unverified_entry(
+                account, "ambiguous PLACE reconciled but OSO child identities unavailable"
+            )
+        except AcceptedOrderError as exc:
+            await self._flatten_unverified_entry(account, str(exc))
 
     async def place_asw_limit(self, account: str, alloc: Allocation, custom_order_id: str,
-                              *, expiry_time_ms: int, now_ms: int) -> ExecutionReceipt:
+                              *, expiry_time_ms: int, now_ms: int,
+                              deadline_epoch: float | None = None,
+                              admission_guard=None) -> ExecutionReceipt:
         if alloc.engine != "ASW":
             raise ValueError("place_asw_limit requires ASW allocation")
         remaining_ms = int(expiry_time_ms) - int(now_ms)
@@ -407,7 +592,10 @@ class Executor:
             "text": f"AutoProp ASW {alloc.event_id}"[:64],
         }
         try:
-            result = await self.client.place(account, payload)
+            result = await self._place(
+                account, payload, deadline_epoch=deadline_epoch,
+                admission_guard=admission_guard,
+            )
         except AmbiguousMutation:
             parent_id = await self._reconcile_custom_order(account, custom_order_id)
             if not parent_id:
@@ -432,11 +620,11 @@ class Executor:
             raise ProtectionFailure("ASW LIMIT placement missing parent/OSO child identity; canceled/flattened")
         return ExecutionReceipt(result, sorted(child_ids), parent_id)
 
-    async def place_core(self, account: str, alloc: Allocation, custom_order_id: str) -> ExecutionReceipt:
+    async def submit_core(self, account: str, alloc: Allocation, custom_order_id: str, *,
+                          deadline_epoch: float | None = None,
+                          admission_guard=None) -> ExecutionReceipt:
         if alloc.tp2 is None:
             raise ValueError("Core allocation missing TP2")
-        before = await self._raw_working_orders(account)
-        before_ids = {_order_id(o) for o in before if _order_id(o)}
         # Immediate native multi-tier protection. CrossTrade's ATM arrays are documented as
         # comma-separated strings of fill-relative offsets/quantities. They are provisional;
         # exact absolute Pine-derived prices are normalized immediately after acceptance.
@@ -446,32 +634,65 @@ class Executor:
         targets = [tp1_off] + ([tp2_off] if alloc.runner_qty else [])
         stops = [risk_pts] * len(targets)
         qtys = [alloc.tp1_qty] + ([alloc.runner_qty] if alloc.runner_qty else [])
-        fmt = lambda xs: ",".join(f"{float(x):g}" for x in xs)
+        # Tradovate ATM bare numeric distances are ticks, while Pine geometry is in
+        # price points. Convert explicitly so provisional native protection is exact even
+        # before asynchronous absolute-price normalization.
+        fmt_ticks = lambda xs: ",".join(f"{float(x) / TICK:g}" for x in xs)
         payload = {"instrument": self._symbol(), "action": "buy" if alloc.side == "LONG" else "sell",
                    "qty": alloc.qty, "orderType": "market", "orderId": custom_order_id,
-                   "atmTargets": fmt(targets), "atmStops": fmt(stops),
+                   "atmTargets": fmt_ticks(targets), "atmStops": fmt_ticks(stops),
                    "atmQtys": ",".join(str(int(x)) for x in qtys),
+                   "requireMarketPosition": "flat", "maxPositions": 1,
                    "text": f"AutoProp CORE {alloc.event_id}"}
         try:
-            result = await self.client.place(account, payload)
+            result = await self._place(
+                account, payload, deadline_epoch=deadline_epoch,
+                admission_guard=admission_guard,
+            )
         except AmbiguousMutation:
-            parent_id = await self._reconcile_custom_order(account, custom_order_id)
-            if not parent_id:
-                raise ProtectionFailure("ambiguous Core PLACE could not be reconciled; no resend")
-            result = {"reconciled": True, "response": {"orderId": parent_id}}
+            # Inline ATM returns an orderStrategyId and has no public strategy-child lookup.
+            # Never resend an ambiguous market entry; the durable SUBMITTING attempt is
+            # reconciled/flattened by LiveRouter instead.
+            raise
         parent_id = _place_parent_id(result)
-        response_ids = _place_child_ids(result)
+        if not parent_id:
+            receipt = ExecutionReceipt(result, [])
+            raise AcceptedOrderError(
+                "accepted Core ATM response missing orderStrategyId/orderId", receipt
+            )
+        return ExecutionReceipt(result, [], parent_id)
+
+    async def finalize_core(self, account: str, alloc: Allocation,
+                            before_ids: set[str]) -> ExecutionReceipt:
+        """Discover and normalize a previously accepted native Core ATM."""
+        owned, target_ids, stop_ids = await self._normalize_core_multibracket(
+            account, alloc, before_ids, set()
+        )
+        return ExecutionReceipt({}, sorted(owned), None,
+                                sorted(target_ids), sorted(stop_ids))
+
+    async def place_core(self, account: str, alloc: Allocation, custom_order_id: str, *,
+                         before_ids: set[str] | None = None,
+                         deadline_epoch: float | None = None,
+                         admission_guard=None) -> ExecutionReceipt:
+        """Compatibility wrapper; LiveRouter splits submit from Core normalization."""
+        if before_ids is None:
+            before = await self._raw_working_orders(account)
+            before_ids = {_order_id(o) for o in before if _order_id(o)}
+        receipt = await self.submit_core(
+            account, alloc, custom_order_id, deadline_epoch=deadline_epoch,
+            admission_guard=admission_guard,
+        )
         # CRITICAL RC2 call site: normalization is mandatory in the direct production path.
         try:
-            owned, target_ids, stop_ids = await self._normalize_core_multibracket(
-                account, alloc, before_ids, response_ids
-            )
-        except CrossTradeError as exc:
+            finalized = await self.finalize_core(account, alloc, before_ids)
+        except (CrossTradeError, ProtectionFailure) as exc:
             await self._flatten_unverified_entry(
                 account, f"Core exact readback unavailable after accepted PLACE: {exc}"
             )
-        return ExecutionReceipt(result, sorted(owned), parent_id,
-                                sorted(target_ids), sorted(stop_ids))
+        finalized.result = receipt.result
+        finalized.parent_order_id = receipt.parent_order_id
+        return finalized
 
     async def _read_order(self, account: str, oid: str) -> dict[str, Any] | None:
         try:
@@ -479,34 +700,97 @@ class Executor:
         except CrossTradeError:
             return None
 
-    async def _change_exact(self, account: str, oid: str, payload: dict[str, Any]) -> None:
+    async def _change_exact_legacy(self, account: str, oid: str,
+                                   payload: dict[str, Any]) -> None:
+        """Compatibility path for test doubles/alternate clients without lifecycle.
+
+        Production CrossTradeClient always exposes ``order_lifecycle`` and therefore never
+        uses this weaker path.
+        """
         last: Exception | None = None
-        for _ in range(self.change_retries):
+        for _ in range(max(1, self.change_retries)):
             try:
                 await self.client.change(account, oid, payload)
-            except AmbiguousMutation as e:
-                # Read-after-ambiguous-change first. If the desired child state is already
-                # present, treat the mutation as accepted; otherwise bounded idempotent retry.
-                last = e
-                current = await self._read_order(account, oid)
-                if current is not None and _desired_matches(current, payload):
-                    return
-            except RateLimitExceeded as e:
-                # The transport never resends a rate-limited mutation. Reconcile first;
-                # only the outer exact-change loop may issue another idempotent CHANGE.
-                last = e
-                current = await self._read_order(account, oid)
-                if current is not None and _desired_matches(current, payload):
-                    return
-            except CrossTradeError as e:
-                raise ProtectionFailure(f"definitive child {oid} change failure: {e}") from e
-            else:
-                current = await self._read_order(account, oid)
-                if current is not None and _desired_matches(current, payload):
-                    return
-                last = ProtectionFailure(f"child {oid} change acknowledged but exact readback differs")
+            except (AmbiguousMutation, RateLimitExceeded) as exc:
+                last = exc
+            except CrossTradeError as exc:
+                raise ProtectionFailure(f"definitive child {oid} change failure: {exc}") from exc
+            current = await self._read_order(account, oid)
+            if current is not None and _desired_matches(current, payload):
+                return
+            last = last or ProtectionFailure(
+                f"child {oid} change acknowledged but exact readback differs"
+            )
             await asyncio.sleep(self.change_delay)
         raise ProtectionFailure(f"could not normalize child {oid}: {last}")
+
+    async def _change_exact(self, account: str, oid: str, payload: dict[str, Any]) -> None:
+        # Old unit fakes and alternate clients may already expose enriched order rows but no
+        # lifecycle endpoint. The production client always has lifecycle and must use the
+        # command/report-correlated path below.
+        if getattr(self.client, "order_lifecycle", None) is None:
+            await self._change_exact_legacy(account, oid, payload)
+            return
+
+        baseline = await self._read_order(account, oid)
+        if baseline is None or "_lifecycle_commands" not in baseline:
+            raise ProtectionFailure(
+                f"child {oid} lifecycle unavailable before CHANGE; mutation withheld"
+            )
+        baseline_unavailable = {
+            str(value) for value in baseline.get("_lifecycle_unavailable", [])
+        }
+        if "commands" in baseline_unavailable:
+            raise ProtectionFailure(
+                f"child {oid} lifecycle commands unavailable before CHANGE; mutation withheld"
+            )
+        baseline_modify_ids = _modify_command_ids(baseline)
+
+        rate_attempts = 0
+        while True:
+            ambiguous: Exception | None = None
+            try:
+                await self.client.change(account, oid, payload)
+            except AmbiguousMutation as exc:
+                # A timeout/5xx may have reached the broker. Reconcile this exact command;
+                # never issue a second CHANGE while its outcome is unknown.
+                ambiguous = exc
+            except RateLimitExceeded as exc:
+                # CrossTrade documents an explicit HTTP 429 as refused before execution.
+                # It is the sole mutation failure that is safe to resend after cooldown.
+                rate_attempts += 1
+                if rate_attempts >= max(1, self.change_retries):
+                    raise ProtectionFailure(
+                        f"child {oid} CHANGE remained rate-limited: {exc}"
+                    ) from exc
+                await asyncio.sleep(self.change_delay)
+                continue
+            except CrossTradeError as exc:
+                raise ProtectionFailure(f"definitive child {oid} change failure: {exc}") from exc
+
+            last_detail = str(ambiguous or "CHANGE acknowledged; lifecycle pending")
+            for poll in range(max(1, self.change_retries)):
+                current = await self._read_order(account, oid)
+                if current is not None:
+                    outcome, detail, _observed = _change_confirmation(
+                        current, baseline_modify_ids, payload
+                    )
+                    last_detail = detail
+                    if outcome == "confirmed":
+                        return
+                    if outcome == "rejected":
+                        raise ProtectionFailure(f"child {oid} CHANGE rejected: {detail}")
+                else:
+                    last_detail = "lifecycle read unavailable after CHANGE"
+                if poll + 1 < max(1, self.change_retries):
+                    await asyncio.sleep(self.change_delay)
+
+            # Geometry may already match a rejected OrderVersion. Without a final new
+            # Modify command/report, retrying could race an in-flight broker command.
+            suffix = f"; transport result was ambiguous: {ambiguous}" if ambiguous else ""
+            raise ProtectionFailure(
+                f"child {oid} CHANGE outcome unconfirmed; no resend: {last_detail}{suffix}"
+            )
 
     async def _normalize_core_multibracket(self, account: str, alloc: Allocation,
                                            before_ids: set[str], response_ids: set[str]) -> tuple[set[str], list[str], list[str]]:
@@ -521,7 +805,7 @@ class Executor:
             owned_rows = _owned(orders, owned_ids)
             targets, stops = classify_children(owned_rows)
             expected_targets = 1 + (1 if alloc.runner_qty else 0)
-            if len(targets) == expected_targets and stops:
+            if len(targets) == expected_targets and len(stops) == expected_targets:
                 # TP1 is always the nearer target. Identify tiers by side/absolute price
                 # rather than distance from the planned entry so broker slippage cannot swap
                 # target ownership: LONG TP1 is the lower target; SHORT TP1 is the higher.
@@ -560,9 +844,7 @@ class Executor:
                         )
                     await asyncio.sleep(self.bracket_confirm_delay)
             await asyncio.sleep(self.bracket_confirm_delay)
-        await self._flatten_unverified_entry(
-            account, "Core owned bracket normalization/readback failed"
-        )
+        raise ProtectionFailure("Core owned bracket normalization/readback failed")
 
 
     async def working_orders(self, account: str) -> list[dict[str, Any]]:

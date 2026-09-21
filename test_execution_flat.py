@@ -63,9 +63,12 @@ async def test_single_uses_exact_returned_child_ids_and_ignores_unrelated():
 @pytest.mark.asyncio
 async def test_ambiguous_place_is_never_resent():
     c=FakeClient("ambiguous"); e=Executor(c,bracket_confirm_retries=1,bracket_confirm_delay=0,change_delay=0)
-    r=await e.place_single("acct",alloc(),"AP_e_A")
+    # The broker may have accepted the parent, but a lost PLACE response also loses
+    # the documented oso1Id/oso2Id role mapping. Never guess ownership or resend.
+    with pytest.raises(ProtectionFailure, match="OSO child identities unavailable"):
+        await e.place_single("acct",alloc(),"AP_e_A")
     assert c.place_calls==1
-    assert set(r.child_order_ids)=={"t1","s1"}
+    assert c.flatten_calls==1
 
 @pytest.mark.asyncio
 async def test_unreconciled_ambiguous_place_fails_without_resend():
@@ -80,8 +83,8 @@ async def test_unreconciled_ambiguous_place_fails_without_resend():
 async def test_core_atm_fields_are_comma_separated_strings_and_call_normalization():
     c=FakeClient(); e=Executor(c,bracket_confirm_retries=2,bracket_confirm_delay=0,change_delay=0)
     a=alloc("CORE",5); r=await e.place_core("acct",a,"AP_e_A")
-    assert c.last_payload["atmTargets"]=="5,10"
-    assert c.last_payload["atmStops"]=="5,5"
+    assert c.last_payload["atmTargets"]=="20,40"
+    assert c.last_payload["atmStops"]=="20,20"
     assert c.last_payload["atmQtys"]=="3,2"
     assert all(isinstance(c.last_payload[k],str) for k in ("atmTargets","atmStops","atmQtys"))
     assert set(r.child_order_ids)=={"t1","s1","t2","s2"}

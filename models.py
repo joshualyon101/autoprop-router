@@ -198,3 +198,49 @@ class ActiveTrade(BaseModel):
     parent_order_id: Optional[str] = None
     custom_order_id: Optional[str] = None
     org_attempt_key: Optional[str] = None
+
+
+EntryAttemptState = Literal[
+    "PREPARED", "SUBMITTING", "ACCEPTED", "ACTIVE", "CLOSED",
+    "FLATTENING", "FLAT", "FAILED", "ABORTED",
+]
+
+
+class EntryAttempt(BaseModel):
+    """Durable per-account mutation state around the accepted-order boundary.
+
+    The row exists before PLACE and survives until the accepted broker exposure is
+    promoted to ActiveTrade or reaches a terminal state. This closes the crash/race
+    window where an EXIT or restart previously could not see a live order.
+    """
+    attempt_key: str
+    account_id: str
+    crosstrade_account: str
+    event_id: str
+    engine: str
+    side: Side
+    qty: int
+    planned_entry: float
+    stop: float
+    tp1: float
+    tp2: Optional[float] = None
+    tp1_qty: int
+    runner_qty: int
+    custom_order_id: str
+    entry_native_bar_index: Optional[int] = None
+    entry_receipt_epoch: float = 0.0
+    inbox_event_key: str = ""
+    state: EntryAttemptState = "PREPARED"
+    parent_order_id: Optional[str] = None
+    target_order_ids: list[str] = []
+    stop_order_ids: list[str] = []
+    child_order_ids: list[str] = []
+    preexisting_order_ids: list[str] = []
+    actual_entry: Optional[float] = None
+    accepted_at_epoch: Optional[float] = None
+    submit_started_at_epoch: Optional[float] = None
+    created_at_epoch: float
+    updated_at_epoch: float
+    reconcile_attempts: int = 0
+    next_reconcile_at_epoch: float = 0.0
+    last_error: str = ""

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -24,6 +25,10 @@ class RateLimitExceeded(CrossTradeError):
 
 class InstrumentContractError(CrossTradeError):
     """Broker execution symbol is invalid/untranslatable for the MNQ-only AutoProp route."""
+
+
+class EntryAdmissionClosed(CrossTradeError):
+    """A new-risk mutation missed its deadline or crossed a durable control fence."""
 
 
 _MNQ_DATED_RE = re.compile(r"^MNQ[FGHJKMNQUVXZ]\d{1,2}$")
@@ -57,18 +62,37 @@ _RATE_LOCK_LOOP = None
 _BLOCKED_UNTIL = 0.0
 _ACCOUNT_BLOCKED_UNTIL: dict[str, float] = {}
 _NEXT_REQUEST_AT = 0.0
+_BURST_TOKENS = 20.0
+_BURST_UPDATED_AT = time.monotonic()
 _GET_SEMAPHORE: asyncio.Semaphore | None = None
 _GET_SEMAPHORE_LOOP = None
 _GET_SEMAPHORE_CAPACITY = 0
 
 
+def _guard_open(guard) -> bool:
+    value = guard()
+    if inspect.isawaitable(value):
+        close = getattr(value, 'close', None)
+        if close is not None:
+            close()
+        raise CrossTradeError('entry admission guard must be synchronous')
+    return bool(value)
+
+
 def _rate_lock() -> asyncio.Lock:
     """Return a lock bound to the current event loop (safe for tests using asyncio.run)."""
-    global _RATE_LOCK, _RATE_LOCK_LOOP
+    global _RATE_LOCK, _RATE_LOCK_LOOP, _BURST_TOKENS, _BURST_UPDATED_AT
+    global _NEXT_REQUEST_AT, _BLOCKED_UNTIL
     loop = asyncio.get_running_loop()
     if _RATE_LOCK is None or _RATE_LOCK_LOOP is not loop:
         _RATE_LOCK = asyncio.Lock()
         _RATE_LOCK_LOOP = loop
+        _RATE_TIMES.clear()
+        _BURST_TOKENS = 20.0
+        _BURST_UPDATED_AT = time.monotonic()
+        _NEXT_REQUEST_AT = 0.0
+        _BLOCKED_UNTIL = 0.0
+        _ACCOUNT_BLOCKED_UNTIL.clear()
     return _RATE_LOCK
 
 
@@ -91,17 +115,24 @@ def _get_semaphore(capacity: int) -> asyncio.Semaphore:
 
 
 async def _acquire_rate_slot(limit: int, window_seconds: float, *, path: str,
-                             min_interval_seconds: float) -> None:
+                             min_interval_seconds: float,
+                             deadline_epoch: float | None = None,
+                             admission_guard=None,
+                             reserve_tokens: float = 0.0) -> None:
     """Acquire one paced process-wide request slot and honor active penalty windows."""
-    global _BLOCKED_UNTIL, _NEXT_REQUEST_AT
+    global _BLOCKED_UNTIL, _NEXT_REQUEST_AT, _BURST_TOKENS, _BURST_UPDATED_AT
     limit = max(1, int(limit))
     window_seconds = max(1.0, float(window_seconds))
     min_interval_seconds = max(0.0, float(min_interval_seconds))
+    reserve_tokens = max(0.0, min(19.0, float(reserve_tokens)))
     account = _account_from_path(path)
     while True:
         lock = _rate_lock()
         async with lock:
             now = time.monotonic()
+            elapsed = max(0.0, now - _BURST_UPDATED_AT)
+            _BURST_TOKENS = min(20.0, _BURST_TOKENS + elapsed * 3.0)
+            _BURST_UPDATED_AT = now
             while _RATE_TIMES and now - _RATE_TIMES[0] >= window_seconds:
                 _RATE_TIMES.popleft()
 
@@ -109,12 +140,24 @@ async def _acquire_rate_slot(limit: int, window_seconds: float, *, path: str,
             blocked_until = max(_BLOCKED_UNTIL, account_blocked_until, _NEXT_REQUEST_AT)
             if now < blocked_until:
                 delay = blocked_until - now
-            elif len(_RATE_TIMES) < limit:
+            elif len(_RATE_TIMES) < limit and _BURST_TOKENS >= 1.0 + reserve_tokens:
+                if deadline_epoch is not None and time.time() > float(deadline_epoch):
+                    raise EntryAdmissionClosed(
+                        f"request {path} blocked: entry dispatch deadline expired"
+                    )
+                if admission_guard is not None and not _guard_open(admission_guard):
+                    raise EntryAdmissionClosed(f"request {path} blocked by control fence")
                 _RATE_TIMES.append(now)
+                _BURST_TOKENS -= 1.0
                 _NEXT_REQUEST_AT = now + min_interval_seconds
                 return
             else:
-                delay = max(0.01, window_seconds - (now - _RATE_TIMES[0]))
+                delays = [0.01]
+                if len(_RATE_TIMES) >= limit:
+                    delays.append(window_seconds - (now - _RATE_TIMES[0]))
+                if _BURST_TOKENS < 1.0 + reserve_tokens:
+                    delays.append((1.0 + reserve_tokens - _BURST_TOKENS) / 3.0)
+                delay = max(delays)
         await asyncio.sleep(delay)
 
 
@@ -189,6 +232,7 @@ class CrossTradeClient:
     rate_limit_max_retries: int = 8
     rate_limit_fallback_seconds: float = 1.0
     request_min_interval_seconds: float = 0.10
+    mutation_min_interval_seconds: float = 0.02
     safe_get_max_concurrency: int = 2
     # Read-only broker calls are safe to retry on transient transport/snapshot-refresh
     # failures. Mutations retain the strict ambiguous-mutation no-resend contract.
@@ -196,28 +240,73 @@ class CrossTradeClient:
     get_retry_delay_seconds: float = 0.75
     get_retry_backoff_multiplier: float = 2.0
     get_retry_max_delay_seconds: float = 5.0
+    _http: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
+    _http_loop: Any = field(default=None, init=False, repr=False)
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
+    def _http_client(self) -> httpx.AsyncClient:
+        """Reuse TCP/TLS connections instead of rebuilding a client for every broker call."""
+        loop = asyncio.get_running_loop()
+        if self._http is None or self._http_loop is not loop:
+            self._http = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+            self._http_loop = loop
+        return self._http
+
+    async def close(self) -> None:
+        client, self._http = self._http, None
+        self._http_loop = None
+        if client is not None:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+
     async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         url = self.base_url.rstrip("/") + path
         method_u = method.upper()
+        deadline_epoch = kwargs.pop("_deadline_epoch", None)
+        admission_guard = kwargs.pop("_admission_guard", None)
         get_attempts = 0
         while True:
+            # The all-account snapshot is the ENTRY preflight immediately before the
+            # mutation wave. CrossTrade documents a 20-request burst allowance, so do
+            # not make the first PLACE inherit the slower background-GET pacing gap.
+            # It still consumes a token and remains inside the shared rolling budget.
+            request_interval = (
+                self.mutation_min_interval_seconds
+                if method_u != "GET" or path == "/v1/api/tv/accounts/snapshot"
+                else self.request_min_interval_seconds
+            )
             await _acquire_rate_slot(
                 self.rate_limit_per_minute, self.rate_limit_window_seconds,
-                path=path, min_interval_seconds=self.request_min_interval_seconds,
+                path=path,
+                min_interval_seconds=request_interval,
+                deadline_epoch=deadline_epoch,
+                admission_guard=admission_guard,
+                # Preserve enough of CrossTrade's documented 20-token burst for one
+                # account snapshot plus eight entry/control mutations. Low-priority reads
+                # refill above this reserve instead of starving safety commands.
+                reserve_tokens=(0.0 if method_u != "GET"
+                                or path == "/v1/api/tv/accounts/snapshot" else 9.0),
             )
+            # The final admission check deliberately occurs after rate waiting and directly
+            # before the irreversible broker call.
+            if deadline_epoch is not None and time.time() > float(deadline_epoch):
+                raise EntryAdmissionClosed(f"{method_u} {path} blocked: entry dispatch deadline expired")
+            if admission_guard is not None and not _guard_open(admission_guard):
+                raise EntryAdmissionClosed(f"{method_u} {path} blocked by control fence")
             try:
+                client = self._http_client()
                 if method_u == "GET":
                     async with _get_semaphore(self.safe_get_max_concurrency):
-                        async with httpx.AsyncClient(timeout=self.timeout) as client:
-                            r = await client.request(method_u, url, headers=self._headers(), **kwargs)
-                else:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
                         r = await client.request(method_u, url, headers=self._headers(), **kwargs)
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                else:
+                    r = await client.request(method_u, url, headers=self._headers(), **kwargs)
+            except httpx.TransportError as e:
                 detail = str(e).strip() or type(e).__name__
                 if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                     raise AmbiguousMutation(f"{method_u} {path} network error: {detail}") from e
@@ -237,9 +326,12 @@ class CrossTradeClient:
                     self.get_retry_delay_seconds, self.get_retry_backoff_multiplier,
                     self.get_retry_max_delay_seconds, max(1, get_attempts + 1),
                 ))
-                if rejection in {"snapshot_refresh_pending", "broker_rate_limited"}:
+                if rejection == "snapshot_refresh_pending":
                     await _apply_account_cooldown(path, cooldown)
                 else:
+                    # CrossTrade's public budget and Tradovate's broker 429 are both
+                    # user/identity scoped, not account scoped. Continuing on sibling
+                    # accounts during a broker penalty can extend the block.
                     await _apply_global_cooldown(cooldown)
                 if (method_u == "GET"
                         and rejection in {"snapshot_refresh_pending", "broker_rate_limited", "rate_limited"}
@@ -260,10 +352,34 @@ class CrossTradeClient:
                 if "cannot translate" in lower and "tradovate symbol" in lower:
                     raise InstrumentContractError(f"HTTP {r.status_code}: {body}")
                 raise CrossTradeError(f"HTTP {r.status_code}: {body}")
-            return r.json() if r.content else {}
+            if not r.content:
+                return {}
+            try:
+                payload = r.json()
+            except Exception as exc:
+                if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
+                    raise AmbiguousMutation(
+                        f"{method_u} {path} returned malformed success JSON"
+                    ) from exc
+                raise CrossTradeError(f"GET {path} returned malformed JSON") from exc
+            if not isinstance(payload, dict):
+                if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
+                    raise AmbiguousMutation(
+                        f"{method_u} {path} returned a non-object success body"
+                    )
+                raise CrossTradeError(f"GET {path} returned a non-object body")
+            if payload.get("success") is False:
+                detail = str(payload.get("error") or payload.get("message") or payload)[:300]
+                raise CrossTradeError(
+                    f"{method_u} {path} API rejected request: {detail}"
+                )
+            return payload
 
     async def list_accounts(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/api/tv/accounts")
+
+    async def accounts_snapshot(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/api/tv/accounts/snapshot")
 
     async def get_account(self, account: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/api/tv/accounts/{account}")
@@ -294,12 +410,17 @@ class CrossTradeClient:
             params["cursor"] = cursor
         return await self._request("GET", "/v1/api/tv/fills/history", params=params)
 
-    async def place(self, account: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def place(self, account: str, payload: dict[str, Any], *,
+                    deadline_epoch: float | None = None,
+                    admission_guard=None) -> dict[str, Any]:
         if "instrument" not in payload:
             raise InstrumentContractError("CrossTrade PLACE payload missing instrument")
         normalized = dict(payload)
         normalized["instrument"] = normalize_tradovate_symbol(normalized["instrument"])
-        return await self._request("POST", f"/v1/api/tv/accounts/{account}/orders/place", json=normalized)
+        return await self._request(
+            "POST", f"/v1/api/tv/accounts/{account}/orders/place", json=normalized,
+            _deadline_epoch=deadline_epoch, _admission_guard=admission_guard,
+        )
 
     async def order_status(self, account: str, order_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/api/tv/accounts/{account}/orders/{order_id}/status")
