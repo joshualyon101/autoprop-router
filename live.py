@@ -9,10 +9,12 @@ from typing import Any
 
 from allocation import allocate, allocate_asw, AllocationBlocked
 from crosstrade import (AmbiguousMutation, CrossTradeClient, CrossTradeError,
-                        EntryAdmissionClosed, InstrumentContractError,
+                        EntryAdmissionClosed, InstrumentContractError, RateLimitExceeded,
                         normalize_tradovate_symbol)
 from events import ParsedEvent
-from execution import AcceptedOrderError, Executor, ProtectionFailure, verify_single_bracket
+from execution import (AcceptedOrderError, Executor, NormalizationMutationUnconfirmed,
+                       NormalizationSuperseded, ProtectionFailure,
+                       verify_single_bracket)
 from management import core_on_market_pulse, silver_lock_stop
 from models import (AccountRule, AccountState, ActiveTrade, Allocation, AswPending,
                     EntryAttempt)
@@ -45,6 +47,7 @@ class LiveRouter:
         self.store = store
         self.entry_wave_active = asyncio.Event()
         self._state_refresh_locks: dict[str, asyncio.Lock] = {}
+        self._state_refresh_batch_lock = asyncio.Lock()
         self.client = CrossTradeClient(
             base_url=settings.CROSSTRADE_BASE_URL,
             token=settings.CROSSTRADE_TOKEN,
@@ -184,6 +187,13 @@ class LiveRouter:
         return state
 
     async def refresh_state_cache(self) -> dict:
+        lock = getattr(self, '_state_refresh_batch_lock', None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._state_refresh_batch_lock = lock
+        if lock.locked():
+            return {'coalesced': True, 'results': []}
+
         async def refresh(rule: AccountRule) -> dict:
             if not rule.enabled:
                 return {'account_id': rule.account_id, 'status': 'DISABLED'}
@@ -191,9 +201,38 @@ class LiveRouter:
                 state = await self.state_for(rule)
                 return {'account_id': rule.account_id, 'status': 'FRESH',
                         'state_timestamp': state.state_timestamp.isoformat()}
+            except RateLimitExceeded as exc:
+                # CrossTrade can report that its own balance snapshot refresh is already
+                # running. Reuse only a still-entry-eligible cache row; once stale, retain
+                # the ERROR so readiness/new risk fails closed.
+                cached = self.store.get_cached_account_state(rule.account_id)
+                text = str(exc)
+                if cached is not None and 'snapshot_refresh_pending' in text:
+                    stamp = cached.state_timestamp
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=timezone.utc)
+                    age = max(0.0, (
+                        datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)
+                    ).total_seconds())
+                    max_age = min(
+                        float(getattr(self.settings, 'MAX_STATE_AGE_SECONDS', 20)),
+                        float(getattr(
+                            self.settings, 'ENTRY_STATE_CACHE_MAX_AGE_SECONDS', 20.0
+                        )),
+                    )
+                    if age <= max_age:
+                        return {
+                            'account_id': rule.account_id,
+                            'status': 'FRESH_CACHED',
+                            'state_timestamp': stamp.isoformat(),
+                            'reason': 'CrossTrade snapshot refresh already in progress',
+                        }
+                return {'account_id': rule.account_id, 'status': 'ERROR',
+                        'reason': text}
             except Exception as exc:
                 return {'account_id': rule.account_id, 'status': 'ERROR', 'reason': str(exc)}
-        return {'results': await asyncio.gather(*(refresh(rule) for rule in self.accounts))}
+        async with lock:
+            return {'results': await asyncio.gather(*(refresh(rule) for rule in self.accounts))}
 
     async def org_history(self, rule: AccountRule) -> list[dict]:
         now = datetime.now(timezone.utc)
@@ -504,11 +543,19 @@ class LiveRouter:
                 return {'account_id': attempt.account_id, 'status': status}
             detail = 'entry-attempt terminal transition lost its compare-and-swap'
         current = self.store.get_entry_attempt(attempt.attempt_key) or attempt
+        if current.state != 'ACCEPTED':
+            # Another worker (normally EXIT) already advanced ownership. The stale
+            # verifier no longer has authority to open the circuit or resurrect work.
+            return {
+                'account_id': attempt.account_id,
+                'status': 'ATTEMPT_ALREADY_ADVANCED',
+                'attempt_state': current.state,
+            }
         if current.state == 'ACCEPTED':
             self._schedule_entry_reconcile(current, detail)
-        self.store.trip_entry_circuit(
+        self.store.trip_entry_circuit_for_attempt(
+            attempt.attempt_key, ('ACCEPTED',),
             reason=f'{attempt.account_id}: {reason} cleanup unconfirmed: {detail}',
-            event_key=attempt.attempt_key,
             outcome='OWNED_ORDER_CLEANUP_UNCONFIRMED',
         )
         return {'account_id': attempt.account_id, 'status': 'ERROR',
@@ -1558,6 +1605,115 @@ class LiveRouter:
             last_error=str(error)[:2000],
         )
 
+    def _core_normalization_is_current(self, attempt: EntryAttempt) -> bool:
+        latest = self.store.get_entry_attempt(attempt.attempt_key)
+        if latest is None or latest.state != 'ACCEPTED':
+            return False
+        accepted = float(latest.accepted_at_epoch or latest.created_at_epoch)
+        # Control fences are committed at webhook ingress, before the control worker reads
+        # broker state. Stop mutating bracket children as soon as an EXIT/HARD_FLAT wins.
+        return not self.store.entry_aborted_after(latest.engine, accepted)
+
+    async def _normalize_core_attempt(self, attempt: EntryAttempt,
+                                      timeout: float) -> dict[str, Any]:
+        current = self.store.get_entry_attempt(attempt.attempt_key)
+        if current is None or current.state != 'ACCEPTED':
+            return {'account_id': attempt.account_id,
+                    'status': 'NORMALIZATION_SUPERSEDED',
+                    'attempt_state': current.state if current else 'MISSING'}
+        alloc = self._attempt_allocation(current)
+        try:
+            finalized = await self.executor.finalize_core(
+                current.crosstrade_account, alloc,
+                set(current.preexisting_order_ids),
+                still_current=lambda: self._core_normalization_is_current(current),
+            )
+        except NormalizationSuperseded:
+            latest = self.store.get_entry_attempt(current.attempt_key)
+            return {'account_id': current.account_id,
+                    'status': 'NORMALIZATION_SUPERSEDED',
+                    'attempt_state': latest.state if latest else 'MISSING'}
+        except NormalizationMutationUnconfirmed as exc:
+            latest = self.store.get_entry_attempt(current.attempt_key)
+            if latest is None or latest.state != 'ACCEPTED':
+                return {'account_id': current.account_id,
+                        'status': 'NORMALIZATION_SUPERSEDED',
+                        'attempt_state': latest.state if latest else 'MISSING'}
+            reason = f'Core exact bracket CHANGE unconfirmed: {exc}'
+            row = await self._flatten_attempt_once(latest, reason)
+            self.store.delete_cached_account_state(current.account_id)
+            if row.get('status') == 'FLATTENED':
+                self.store.trip_entry_circuit(
+                    reason=f'{current.account_id}: {reason}; fail-safe flatten completed',
+                    event_key=current.attempt_key,
+                    outcome='CORE_NORMALIZATION_MUTATION_UNCONFIRMED',
+                )
+            elif row.get('status') == 'ERROR':
+                self.store.trip_entry_circuit_for_attempt(
+                    current.attempt_key, ('FLATTENING',),
+                    reason=f'{current.account_id}: {reason}',
+                    outcome='CORE_NORMALIZATION_MUTATION_UNCONFIRMED',
+                )
+            return row
+        except Exception as exc:
+            latest = self.store.get_entry_attempt(current.attempt_key)
+            if latest is None or latest.state != 'ACCEPTED':
+                return {'account_id': current.account_id,
+                        'status': 'NORMALIZATION_SUPERSEDED',
+                        'attempt_state': latest.state if latest else 'MISSING'}
+            age = time.time() - float(
+                latest.accepted_at_epoch or latest.created_at_epoch
+            )
+            if age >= timeout:
+                reason = f'Core exact bracket discovery timed out: {exc}'
+                row = await self._flatten_attempt_once(latest, reason)
+                self.store.delete_cached_account_state(current.account_id)
+                if row.get('status') == 'FLATTENED':
+                    self.store.trip_entry_circuit(
+                        reason=f'{current.account_id}: {reason}; fail-safe flatten completed',
+                        event_key=current.attempt_key,
+                        outcome='CORE_NORMALIZATION_TIMEOUT',
+                    )
+                elif row.get('status') == 'ERROR':
+                    self.store.trip_entry_circuit_for_attempt(
+                        current.attempt_key, ('FLATTENING',),
+                        reason=f'{current.account_id}: {reason}',
+                        outcome='CORE_NORMALIZATION_TIMEOUT',
+                    )
+                return row
+            scheduled = self.store.transition_entry_attempt(
+                latest.attempt_key, ('ACCEPTED',), 'ACCEPTED',
+                reconcile_attempts=int(latest.reconcile_attempts) + 1,
+                next_reconcile_at_epoch=time.time() + min(
+                    float(getattr(self.settings, 'ENTRY_RECONCILE_MAX_DELAY_SECONDS', 5.0)),
+                    float(getattr(self.settings, 'ENTRY_RECONCILE_BASE_DELAY_SECONDS', 0.75))
+                    * (2 ** min(int(latest.reconcile_attempts), 8)),
+                ),
+                last_error=str(exc)[:2000],
+            )
+            if scheduled is None:
+                advanced = self.store.get_entry_attempt(current.attempt_key)
+                return {'account_id': current.account_id,
+                        'status': 'NORMALIZATION_SUPERSEDED',
+                        'attempt_state': advanced.state if advanced else 'MISSING'}
+            return {'account_id': current.account_id,
+                    'status': 'CORE_NORMALIZATION_PENDING', 'reason': str(exc)}
+
+        updated = self.store.transition_entry_attempt(
+            current.attempt_key, ('ACCEPTED',), 'ACCEPTED',
+            target_order_ids=list(finalized.target_order_ids),
+            stop_order_ids=list(finalized.stop_order_ids),
+            child_order_ids=list(finalized.child_order_ids),
+            last_error='', next_reconcile_at_epoch=0.0,
+        )
+        if updated is None:
+            advanced = self.store.get_entry_attempt(current.attempt_key)
+            return {'account_id': current.account_id,
+                    'status': 'NORMALIZATION_SUPERSEDED',
+                    'attempt_state': advanced.state if advanced else 'MISSING'}
+        return {'account_id': current.account_id, 'status': 'CORE_NORMALIZED',
+                'child_orders': len(updated.child_order_ids)}
+
     async def reconcile_entry_attempts(self) -> dict:
         """Confirm accepted exposure off the submit path using fill-reconciled state."""
         now_epoch = time.time()
@@ -1567,7 +1723,38 @@ class LiveRouter:
         attempts = self.store.all_entry_attempts(
             ('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING')
         )
+        due_core = [
+            attempt for attempt in attempts
+            if (attempt.state == 'ACCEPTED' and attempt.engine == 'CORE'
+                and not attempt.stop_order_ids
+                and (not attempt.next_reconcile_at_epoch
+                     or attempt.next_reconcile_at_epoch <= now_epoch))
+        ]
+        core_handled: set[str] = set()
+        if due_core:
+            concurrency = max(1, int(getattr(
+                self.settings, 'CORE_NORMALIZATION_MAX_CONCURRENCY', 8
+            )))
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def normalize(attempt: EntryAttempt):
+                async with semaphore:
+                    return await self._normalize_core_attempt(attempt, timeout)
+
+            normalized = await asyncio.gather(*(normalize(a) for a in due_core))
+            results.extend(normalized)
+            core_handled = {
+                attempt.attempt_key for attempt, row in zip(due_core, normalized)
+                if row.get('status') != 'CORE_NORMALIZED'
+            }
+            # EXIT and normalization both use compare-and-swap. Reload authoritative rows
+            # before any fill/protection decision instead of continuing from stale objects.
+            attempts = self.store.all_entry_attempts(
+                ('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING')
+            )
         for attempt in attempts:
+            if attempt.attempt_key in core_handled:
+                continue
             if attempt.next_reconcile_at_epoch and attempt.next_reconcile_at_epoch > now_epoch:
                 continue
             if attempt.state == 'PREPARED':
@@ -1652,42 +1839,12 @@ class LiveRouter:
                 results.append(row)
                 continue
 
-            current = attempt
+            current = self.store.get_entry_attempt(attempt.attempt_key) or attempt
             alloc = self._attempt_allocation(current)
             if current.engine == 'CORE' and not current.stop_order_ids:
-                try:
-                    finalized = await self.executor.finalize_core(
-                        current.crosstrade_account, alloc,
-                        set(current.preexisting_order_ids),
-                    )
-                    updated = self.store.transition_entry_attempt(
-                        current.attempt_key, ('ACCEPTED',), 'ACCEPTED',
-                        target_order_ids=list(finalized.target_order_ids),
-                        stop_order_ids=list(finalized.stop_order_ids),
-                        child_order_ids=list(finalized.child_order_ids),
-                        last_error='', next_reconcile_at_epoch=0.0,
-                    )
-                    if updated is None:
-                        continue
-                    current = updated
-                except Exception as exc:
-                    if age >= timeout:
-                        row = await self._flatten_attempt_once(
-                            current, f'Core exact bracket normalization timed out: {exc}'
-                        )
-                        self.store.delete_cached_account_state(current.account_id)
-                        results.append(row)
-                    else:
-                        self._schedule_entry_reconcile(current, str(exc))
-                        results.append({'account_id': current.account_id,
-                                        'status': 'CORE_NORMALIZATION_PENDING',
-                                        'reason': str(exc)})
-                    self.store.trip_entry_circuit(
-                        reason=f'{current.account_id}: Core normalization pending/failed: {exc}',
-                        event_key=current.attempt_key,
-                        outcome='CORE_NORMALIZATION_UNCONFIRMED',
-                    )
-                    continue
+                # Not due yet or superseded during this pass. The dedicated concurrent
+                # phase above owns Core normalization; never fall back to serial work.
+                continue
 
             if not current.stop_order_ids:
                 row = await self._flatten_attempt_once(
@@ -2181,67 +2338,77 @@ class LiveRouter:
         # Broker-hosted destination targets/stops own normal exits. Source-account exits must
         # not prematurely close a destination whose account-specific target/runner differs.
         rule_map = {a.account_id: a for a in self.accounts}
-        results = []
-        for attempt in self.store.all_entry_attempts(
+        attempts = self.store.all_entry_attempts(
             ('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING')
-        ):
+        )
+
+        async def reconcile_attempt(attempt: EntryAttempt) -> dict[str, Any] | None:
             if (event.engine and event.engine not in {'GLOBAL', 'ACCOUNT'}
                     and attempt.engine != event.engine):
-                continue
+                return None
             rule = rule_map.get(attempt.account_id)
             if rule is None:
-                continue
+                return None
             if attempt.state == 'PREPARED':
                 self.store.transition_entry_attempt(
                     attempt.attempt_key, ('PREPARED',), 'ABORTED',
                     last_error='ordinary EXIT arrived before PLACE',
                 )
-                results.append({'account_id': attempt.account_id,
-                                'status': 'ABORTED_PREPARED_ENTRY'})
-                continue
+                return {'account_id': attempt.account_id,
+                        'status': 'ABORTED_PREPARED_ENTRY'}
             if attempt.state == 'SUBMITTING':
-                results.append({'account_id': attempt.account_id,
-                                'status': 'FENCED_IN_FLIGHT_ENTRY'})
-                continue
+                return {'account_id': attempt.account_id,
+                        'status': 'FENCED_IN_FLIGHT_ENTRY'}
             if attempt.state == 'FLATTENING':
-                results.append({'account_id': attempt.account_id,
-                                'status': 'FLATTEN_RECONCILIATION_PENDING'})
-                continue
+                return {'account_id': attempt.account_id,
+                        'status': 'FLATTEN_RECONCILIATION_PENDING'}
             try:
                 signed = await self.position_qty(rule)
                 if signed == 0:
-                    results.append(await self._finalize_observed_flat_attempt(
+                    return await self._finalize_observed_flat_attempt(
                         rule, attempt,
                         new_state='CLOSED',
                         status='CLOSED_RECONCILED',
                         reason='ordinary EXIT observed destination position flat',
-                    ))
-                else:
-                    results.append({'account_id': attempt.account_id,
-                                    'status': 'STILL_OPEN_DESTINATION_MANAGED',
-                                    'position_qty': abs(signed)})
+                    )
+                return {'account_id': attempt.account_id,
+                        'status': 'STILL_OPEN_DESTINATION_MANAGED',
+                        'position_qty': abs(signed)}
             except (CrossTradeError, StateUnverified) as exc:
-                results.append({'account_id': attempt.account_id,
-                                'status': 'UNKNOWN', 'reason': str(exc)})
-        for trade in self.store.all_trades():
+                return {'account_id': attempt.account_id,
+                        'status': 'UNKNOWN', 'reason': str(exc)}
+
+        trades = self.store.all_trades()
+
+        async def reconcile_trade(trade: ActiveTrade) -> dict[str, Any] | None:
             if event.engine and event.engine not in {'GLOBAL','ACCOUNT'} and trade.engine != event.engine:
-                continue
+                return None
             rule = rule_map.get(trade.account_id)
             if rule is None:
-                continue
+                return None
             try:
                 signed = await self.position_qty(rule)
                 if signed == 0:
-                    results.append(await self._finalize_observed_flat_trade(
+                    return await self._finalize_observed_flat_trade(
                         rule, trade,
                         status='CLOSED_RECONCILED',
                         reason='ordinary EXIT observed destination position flat',
-                    ))
-                else:
-                    results.append({'account_id': rule.account_id, 'status': 'STILL_OPEN_DESTINATION_MANAGED',
-                                    'position_qty': abs(signed)})
+                    )
+                return {'account_id': rule.account_id,
+                        'status': 'STILL_OPEN_DESTINATION_MANAGED',
+                        'position_qty': abs(signed)}
             except (CrossTradeError, StateUnverified) as exc:
-                results.append({'account_id': rule.account_id, 'status': 'UNKNOWN', 'reason': str(exc)})
+                return {'account_id': rule.account_id,
+                        'status': 'UNKNOWN', 'reason': str(exc)}
+
+        # EXIT is a control fence. Query independent destination accounts together so one
+        # slow balance refresh cannot leave later accounts in stale ACCEPTED ownership for
+        # minutes. CrossTradeClient's safe-GET scheduler still enforces broker pacing.
+        rows = await asyncio.gather(
+            *(reconcile_attempt(attempt) for attempt in attempts),
+            *(reconcile_trade(trade) for trade in trades),
+        )
+        results = [row for row in rows if row is not None]
         out = {'kind': 'EXIT', 'results': results}
         unresolved_statuses = {
             'ERROR', 'UNKNOWN', 'FENCED_IN_FLIGHT_ENTRY',

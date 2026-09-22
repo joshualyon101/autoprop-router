@@ -14,6 +14,14 @@ class ProtectionFailure(RuntimeError):
     pass
 
 
+class NormalizationSuperseded(ProtectionFailure):
+    """Core normalization stopped because EXIT/terminal state won the race."""
+
+
+class NormalizationMutationUnconfirmed(ProtectionFailure):
+    """A Core child CHANGE was attempted but its final broker outcome is unsafe."""
+
+
 class AcceptedOrderError(ProtectionFailure):
     """A PLACE may be live, but its ownership/protection receipt is incomplete.
 
@@ -456,15 +464,20 @@ class Executor:
 
     async def _working_orders(self, account: str) -> list[dict[str, Any]]:
         raw_rows = await self._raw_working_orders(account)
-        out: list[dict[str, Any]] = []
-        for raw in raw_rows:
+        async def enrich(raw: dict[str, Any]) -> dict[str, Any] | None:
             oid = _order_id(raw)
             if not oid:
-                continue
+                return None
             snap = await self._order_snapshot(account, oid, raw)
             if snap is not None and self._is_live_snapshot(snap):
-                out.append(snap)
-        return out
+                return snap
+            return None
+
+        # Each lifecycle row is independent. CrossTradeClient owns the global GET
+        # semaphore/rate budget, so gathering here removes account-by-account latency
+        # without bypassing broker pacing.
+        snapshots = await asyncio.gather(*(enrich(raw) for raw in raw_rows))
+        return [snap for snap in snapshots if snap is not None]
 
     async def _all_orders(self) -> list[dict[str, Any]]:
         fn = getattr(self.client, "all_orders", None)
@@ -501,12 +514,15 @@ class Executor:
             # Ambiguous/no-child-ID fallback: only orders newly appearing after this placement can
             # be considered. Never adopt pre-existing account orders by price/quantity similarity.
             owned = present - before_ids
-        rows: list[dict[str, Any]] = []
         raw_map = {_order_id(o): o for o in raw_rows if _order_id(o)}
-        for oid in sorted(owned):
+        async def enrich(oid: str) -> dict[str, Any] | None:
             snap = await self._order_snapshot(account, oid, raw_map.get(oid))
             if snap is not None and self._is_live_snapshot(snap):
-                rows.append(snap)
+                return snap
+            return None
+
+        snapshots = await asyncio.gather(*(enrich(oid) for oid in sorted(owned)))
+        rows = [snap for snap in snapshots if snap is not None]
         # If response named children that are not yet visible, ``owned`` stays incomplete
         # and the caller retries rather than widening ownership.
         return rows, owned
@@ -663,10 +679,10 @@ class Executor:
         return ExecutionReceipt(result, [], parent_id)
 
     async def finalize_core(self, account: str, alloc: Allocation,
-                            before_ids: set[str]) -> ExecutionReceipt:
+                            before_ids: set[str], *, still_current=None) -> ExecutionReceipt:
         """Discover and normalize a previously accepted native Core ATM."""
         owned, target_ids, stop_ids = await self._normalize_core_multibracket(
-            account, alloc, before_ids, set()
+            account, alloc, before_ids, set(), still_current=still_current
         )
         return ExecutionReceipt({}, sorted(owned), None,
                                 sorted(target_ids), sorted(stop_ids))
@@ -700,8 +716,16 @@ class Executor:
         except CrossTradeError:
             return None
 
+    @staticmethod
+    def _require_current(still_current) -> None:
+        if still_current is not None and not bool(still_current()):
+            raise NormalizationSuperseded(
+                "Core normalization superseded by EXIT or terminal attempt state"
+            )
+
     async def _change_exact_legacy(self, account: str, oid: str,
-                                   payload: dict[str, Any]) -> None:
+                                   payload: dict[str, Any], *,
+                                   still_current=None) -> dict[str, Any]:
         """Compatibility path for test doubles/alternate clients without lifecycle.
 
         Production CrossTradeClient always exposes ``order_lifecycle`` and therefore never
@@ -709,6 +733,7 @@ class Executor:
         """
         last: Exception | None = None
         for _ in range(max(1, self.change_retries)):
+            self._require_current(still_current)
             try:
                 await self.client.change(account, oid, payload)
             except (AmbiguousMutation, RateLimitExceeded) as exc:
@@ -717,22 +742,26 @@ class Executor:
                 raise ProtectionFailure(f"definitive child {oid} change failure: {exc}") from exc
             current = await self._read_order(account, oid)
             if current is not None and _desired_matches(current, payload):
-                return
+                return current
             last = last or ProtectionFailure(
                 f"child {oid} change acknowledged but exact readback differs"
             )
             await asyncio.sleep(self.change_delay)
         raise ProtectionFailure(f"could not normalize child {oid}: {last}")
 
-    async def _change_exact(self, account: str, oid: str, payload: dict[str, Any]) -> None:
+    async def _change_exact(self, account: str, oid: str, payload: dict[str, Any], *,
+                            baseline: dict[str, Any] | None = None,
+                            still_current=None) -> dict[str, Any]:
         # Old unit fakes and alternate clients may already expose enriched order rows but no
         # lifecycle endpoint. The production client always has lifecycle and must use the
         # command/report-correlated path below.
         if getattr(self.client, "order_lifecycle", None) is None:
-            await self._change_exact_legacy(account, oid, payload)
-            return
+            return await self._change_exact_legacy(
+                account, oid, payload, still_current=still_current
+            )
 
-        baseline = await self._read_order(account, oid)
+        self._require_current(still_current)
+        baseline = baseline or await self._read_order(account, oid)
         if baseline is None or "_lifecycle_commands" not in baseline:
             raise ProtectionFailure(
                 f"child {oid} lifecycle unavailable before CHANGE; mutation withheld"
@@ -745,9 +774,15 @@ class Executor:
                 f"child {oid} lifecycle commands unavailable before CHANGE; mutation withheld"
             )
         baseline_modify_ids = _modify_command_ids(baseline)
+        if _desired_matches(baseline, payload):
+            # A restarted reconciliation may observe the result of its earlier CHANGE,
+            # while a zero-slippage fill can already have exact native ATM geometry.
+            # Either way, another mutation is unnecessary.
+            return baseline
 
         rate_attempts = 0
         while True:
+            self._require_current(still_current)
             ambiguous: Exception | None = None
             try:
                 await self.client.change(account, oid, payload)
@@ -766,10 +801,13 @@ class Executor:
                 await asyncio.sleep(self.change_delay)
                 continue
             except CrossTradeError as exc:
-                raise ProtectionFailure(f"definitive child {oid} change failure: {exc}") from exc
+                raise NormalizationMutationUnconfirmed(
+                    f"definitive child {oid} CHANGE failure: {exc}"
+                ) from exc
 
             last_detail = str(ambiguous or "CHANGE acknowledged; lifecycle pending")
             for poll in range(max(1, self.change_retries)):
+                self._require_current(still_current)
                 current = await self._read_order(account, oid)
                 if current is not None:
                     outcome, detail, _observed = _change_confirmation(
@@ -777,9 +815,11 @@ class Executor:
                     )
                     last_detail = detail
                     if outcome == "confirmed":
-                        return
+                        return current
                     if outcome == "rejected":
-                        raise ProtectionFailure(f"child {oid} CHANGE rejected: {detail}")
+                        raise NormalizationMutationUnconfirmed(
+                            f"child {oid} CHANGE rejected: {detail}"
+                        )
                 else:
                     last_detail = "lifecycle read unavailable after CHANGE"
                 if poll + 1 < max(1, self.change_retries):
@@ -788,12 +828,13 @@ class Executor:
             # Geometry may already match a rejected OrderVersion. Without a final new
             # Modify command/report, retrying could race an in-flight broker command.
             suffix = f"; transport result was ambiguous: {ambiguous}" if ambiguous else ""
-            raise ProtectionFailure(
+            raise NormalizationMutationUnconfirmed(
                 f"child {oid} CHANGE outcome unconfirmed; no resend: {last_detail}{suffix}"
             )
 
     async def _normalize_core_multibracket(self, account: str, alloc: Allocation,
-                                           before_ids: set[str], response_ids: set[str]) -> tuple[set[str], list[str], list[str]]:
+                                           before_ids: set[str], response_ids: set[str], *,
+                                           still_current=None) -> tuple[set[str], list[str], list[str]]:
         """Normalize only proven children to exact absolute prices, then read back.
 
         Ownership comes from broker-returned child IDs when available, otherwise from the
@@ -801,6 +842,7 @@ class Executor:
         mutation authority. Any ambiguity fails toward less exposure by flattening.
         """
         for _ in range(self.bracket_confirm_retries):
+            self._require_current(still_current)
             orders, owned_ids = await self._discover_owned_children(account, before_ids, response_ids)
             owned_rows = _owned(orders, owned_ids)
             targets, stops = classify_children(owned_rows)
@@ -814,35 +856,38 @@ class Executor:
                 desired = [(alloc.tp1_qty, alloc.tp1)]
                 if alloc.runner_qty:
                     desired.append((alloc.runner_qty, float(alloc.tp2)))
-                try:
-                    for o, (q, p) in zip(targets, desired):
-                        oid = _order_id(o)
-                        if not oid:
-                            raise ProtectionFailure("owned target missing broker ID")
-                        await self._change_exact(account, oid, {"qty": q, "orderType": "limit", "limitPrice": p})
-                    # Preserve each native stop child's quantity; normalize only its absolute price.
-                    # Exact aggregate coverage is required by verify_core_bracket.
-                    for o in stops:
-                        oid = _order_id(o)
-                        if not oid:
-                            raise ProtectionFailure("owned stop missing broker ID")
-                        await self._change_exact(account, oid, {"qty": _qty(o), "orderType": "stop", "stopPrice": alloc.stop})
-                except ProtectionFailure:
-                    break
-                for _j in range(self.bracket_confirm_retries):
-                    check = []
-                    for oid in sorted(owned_ids):
-                        snap = await self._order_snapshot(account, oid)
-                        if snap is not None and self._is_live_snapshot(snap):
-                            check.append(snap)
-                    if verify_core_bracket(check, alloc, owned_ids):
-                        verified_targets, verified_stops = classify_children(_owned(check, owned_ids))
-                        return (
-                            owned_ids,
-                            [_order_id(o) for o in verified_targets if _order_id(o)],
-                            [_order_id(o) for o in verified_stops if _order_id(o)],
-                        )
-                    await asyncio.sleep(self.bracket_confirm_delay)
+                check: list[dict[str, Any]] = []
+                for o, (q, p) in zip(targets, desired):
+                    oid = _order_id(o)
+                    if not oid:
+                        raise ProtectionFailure("owned target missing broker ID")
+                    check.append(await self._change_exact(
+                        account, oid,
+                        {"qty": q, "orderType": "limit", "limitPrice": p},
+                        baseline=o, still_current=still_current,
+                    ))
+                # Preserve each native stop child's quantity; normalize only its absolute
+                # price. Accounts run concurrently in LiveRouter, while the four mutations
+                # inside one account remain ordered to avoid a Tradovate account stampede.
+                for o in stops:
+                    oid = _order_id(o)
+                    if not oid:
+                        raise ProtectionFailure("owned stop missing broker ID")
+                    check.append(await self._change_exact(
+                        account, oid,
+                        {"qty": _qty(o), "orderType": "stop", "stopPrice": alloc.stop},
+                        baseline=o, still_current=still_current,
+                    ))
+                if not verify_core_bracket(check, alloc, owned_ids):
+                    raise NormalizationMutationUnconfirmed(
+                        "Core child CHANGE confirmations did not prove exact aggregate coverage"
+                    )
+                verified_targets, verified_stops = classify_children(_owned(check, owned_ids))
+                return (
+                    owned_ids,
+                    [_order_id(o) for o in verified_targets if _order_id(o)],
+                    [_order_id(o) for o in verified_stops if _order_id(o)],
+                )
             await asyncio.sleep(self.bracket_confirm_delay)
         raise ProtectionFailure("Core owned bracket normalization/readback failed")
 

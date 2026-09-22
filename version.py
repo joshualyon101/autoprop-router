@@ -1,2 +1,2 @@
-__version__ = '1.2.8.5-exact-parity-low-latency-fanout-rc1'
+__version__ = '1.2.8.6-exact-parity-core-normalization-race-hotfix-rc1'
 VERSION = __version__

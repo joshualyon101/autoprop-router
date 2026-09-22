@@ -49,7 +49,11 @@ class Settings(BaseSettings):
     ENTRY_SIGNAL_MAX_AGE_SECONDS: float = 8.0
     ENTRY_PREFLIGHT_TIMEOUT_SECONDS: float = 5.0
     ENTRY_FANOUT_MAX_CONCURRENCY: int = 8
-    ENTRY_RECONCILE_TIMEOUT_SECONDS: float = 30.0
+    # Core ATM child discovery/normalization runs after the low-latency PLACE wave.
+    # Eight accounts can consume most of one broker read window, so allow one full
+    # guarded reconciliation cycle before fail-safe flattening.
+    ENTRY_RECONCILE_TIMEOUT_SECONDS: float = 90.0
+    CORE_NORMALIZATION_MAX_CONCURRENCY: int = 8
     ENTRY_RECONCILE_BASE_DELAY_SECONDS: float = 0.75
     ENTRY_RECONCILE_MAX_DELAY_SECONDS: float = 5.0
     ENTRY_RECONCILE_LOOP_SECONDS: float = 0.50

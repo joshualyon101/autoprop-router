@@ -656,6 +656,50 @@ class Store:
         self.set_runtime_state("entry_circuit", payload)
         return payload
 
+    def trip_entry_circuit_for_attempt(
+            self, attempt_key: str, expected_states: Iterable[str], *,
+            reason: str, outcome: str = "") -> dict | None:
+        """Atomically trip only while the named attempt still owns live uncertainty.
+
+        EXIT and reconciliation run on independent workers. A verifier that started from
+        an ACCEPTED snapshot must not open the circuit after EXIT already committed CLOSED.
+        """
+        expected = ((expected_states,) if isinstance(expected_states, str)
+                    else tuple(str(x) for x in expected_states))
+        if not expected:
+            return None
+        payload = {
+            "open": True,
+            "reason": str(reason)[:2000],
+            "event_key": str(attempt_key),
+            "outcome": str(outcome),
+            "opened_at_epoch": time.time(),
+        }
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marks = ",".join("?" for _ in expected)
+            row = conn.execute(
+                f"SELECT 1 FROM entry_attempts WHERE attempt_key=? "
+                f"AND state IN ({marks})",
+                (str(attempt_key), *expected),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('entry_circuit',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(payload, default=str),),
+            )
+            conn.commit()
+            return payload
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def reset_entry_circuit(self) -> dict:
         payload = {"open": False, "reason": "", "event_key": "", "outcome": "",
                    "reset_at_epoch": time.time()}
