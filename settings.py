@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     RISK_STATE_JSON: str = ''
     AUTO_DISCOVERY: bool = True
     FUNDEDNEXT_DEFAULT_MODEL: str = 'Legacy'
+    # Zero-touch enrollment uses an exact verified challenge cohort at the same starting
+    # balance, or an explicit built-in profile for a recognized account identity.
+    AUTO_ONBOARD_VERIFIED_CHALLENGE_COHORTS: bool = True
+    # Compatibility/safety switch for the FundedNext Legacy built-in profile. FundedNext's
+    # broker name does not itself identify the purchased challenge model.
+    AUTO_ONBOARD_FUNDEDNEXT_LEGACY_CHALLENGES: bool = True
+    AUTO_DISCOVERY_INTERVAL_SECONDS: float = 10.0
+    AUTO_ONBOARD_BALANCE_TOLERANCE: float = 1.0
+    AUTO_ONBOARD_FILL_LOOKBACK_DAYS: int = 35
     STATE_POLL_SECONDS: int = 10
     MAX_STATE_AGE_SECONDS: int = 20
     REQUEST_TIMEOUT_SECONDS: float = 6.0
@@ -20,7 +29,7 @@ class Settings(BaseSettings):
     CROSSTRADE_RATE_LIMIT_MAX_RETRIES: int = 8
     CROSSTRADE_RATE_LIMIT_FALLBACK_SECONDS: float = 1.0
     CROSSTRADE_REQUEST_MIN_INTERVAL_SECONDS: float = 0.10
-    # Broker reads stay paced, while one coordinated eight-account entry may use the
+    # Broker reads stay paced, while one coordinated multi-account entry may use the
     # documented burst allowance. Mutations still pass through the rolling-minute cap.
     CROSSTRADE_MUTATION_MIN_INTERVAL_SECONDS: float = 0.02
     CROSSTRADE_SAFE_GET_MAX_CONCURRENCY: int = 2
@@ -48,15 +57,20 @@ class Settings(BaseSettings):
     # preflight is performed as a batch, followed by a tight broker mutation wave.
     ENTRY_SIGNAL_MAX_AGE_SECONDS: float = 8.0
     ENTRY_PREFLIGHT_TIMEOUT_SECONDS: float = 5.0
-    ENTRY_FANOUT_MAX_CONCURRENCY: int = 8
+    ENTRY_FANOUT_MAX_CONCURRENCY: int = 16
     # Core ATM child discovery/normalization runs after the low-latency PLACE wave.
-    # Eight accounts can consume most of one broker read window, so allow one full
-    # guarded reconciliation cycle before fail-safe flattening.
+    # A multi-account fleet can consume most of one broker read window, so allow one
+    # full guarded reconciliation cycle before fail-safe flattening.
     ENTRY_RECONCILE_TIMEOUT_SECONDS: float = 90.0
-    CORE_NORMALIZATION_MAX_CONCURRENCY: int = 8
+    CORE_NORMALIZATION_MAX_CONCURRENCY: int = 16
     ENTRY_RECONCILE_BASE_DELAY_SECONDS: float = 0.75
     ENTRY_RECONCILE_MAX_DELAY_SECONDS: float = 5.0
     ENTRY_RECONCILE_LOOP_SECONDS: float = 0.50
+    # Safety-critical management intent is serviced independently of the webhook inbox.
+    # The short interval is a wake-up fallback; new intent also wakes the loop instantly.
+    SILVER_MANAGEMENT_LOOP_SECONDS: float = 0.25
+    SILVER_MANAGEMENT_RETRY_BASE_SECONDS: float = 0.50
+    SILVER_MANAGEMENT_RETRY_MAX_SECONDS: float = 5.0
     ENTRY_STATE_CACHE_MAX_AGE_SECONDS: float = 20.0
     STARTUP_STATE_WARM_TIMEOUT_SECONDS: float = 20.0
     AUTOPROP_LIVE_ARM: str = ''

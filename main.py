@@ -22,6 +22,7 @@ from state import StateUnverified, ny_date
 from store import Store
 from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 from management import SILVER_STOP_CONTRACT
+from onboarding import discover_and_onboard
 
 settings = Settings()
 store = Store(settings.SQLITE_PATH)
@@ -34,7 +35,11 @@ _worker_wakeup: asyncio.Event | None = None
 _control_worker_wakeup: asyncio.Event | None = None
 _asw_reconcile_task: asyncio.Task | None = None
 _entry_reconcile_task: asyncio.Task | None = None
+_silver_management_task: asyncio.Task | None = None
 _state_refresh_task: asyncio.Task | None = None
+_auto_discovery_task: asyncio.Task | None = None
+_auto_discovery_lock: asyncio.Lock | None = None
+_last_auto_discovery: dict = {}
 _runtime_instance: LiveRouter | None = None
 
 
@@ -112,7 +117,7 @@ async def _process_event(event, *, event_key: str = '', receipt_epoch: float | N
     if event.kind == 'MARKET_PULSE':
         return await rt.market_pulse(event)
     if event.kind == 'SILVER_STOP_MOVE':
-        return await rt.silver_stop(event)
+        return await rt.silver_stop(event, event_key=event_key)
     if event.kind == 'HARD_FLAT':
         return await rt.hard_flat(event)
     if event.kind == 'EXIT':
@@ -155,6 +160,8 @@ async def _webhook_worker(*, control: bool = False):
                 )
             if new_risk and store.unresolved_entry_attempt_count():
                 raise RuntimeError('new-risk blocked: prior entry attempt is unresolved')
+            if new_risk and store.silver_stop_intent():
+                raise RuntimeError('new-risk blocked: Silver protection intent is pending')
             if new_risk and base is not None and not base['configuration_ready']:
                 raise RuntimeError(f"router configuration not ready: {base['problems']}")
             result = _annotate_execution_result(await _process_event(
@@ -228,11 +235,39 @@ async def _entry_reconcile_loop():
         await asyncio.sleep(max(0.1, float(settings.ENTRY_RECONCILE_LOOP_SECONDS)))
 
 
+async def _silver_management_loop():
+    """Service durable Silver protection independently of webhook retry accounting."""
+    while True:
+        rt = _runtime()
+        wakeup = rt.silver_management_wakeup
+        wakeup.clear()
+        try:
+            result = await rt.service_silver_stop_intent()
+            if result.get('status') not in {'IDLE', 'BACKOFF'}:
+                logger.info('SILVER priority management %s', result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('SILVER priority management failed')
+        try:
+            await asyncio.wait_for(
+                wakeup.wait(),
+                timeout=max(0.05, float(settings.SILVER_MANAGEMENT_LOOP_SECONDS)),
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _state_refresh_loop():
     while True:
+        delay = max(1.0, float(settings.STATE_POLL_SECONDS))
         try:
             rt = _runtime()
-            if not getattr(rt, 'entry_wave_active', None) or not rt.entry_wave_active.is_set():
+            if rt.safety_work_pending():
+                # Recheck promptly after a trade closes so the entry cache can warm for
+                # the next signal instead of remaining stale for a full poll interval.
+                delay = 1.0
+            else:
                 result = await rt.refresh_state_cache()
                 failed = [r for r in result.get('results', []) if r.get('status') == 'ERROR']
                 if failed:
@@ -241,13 +276,70 @@ async def _state_refresh_loop():
             raise
         except Exception:
             logger.exception('Account-state cache refresh failed')
-        await asyncio.sleep(max(1.0, float(settings.STATE_POLL_SECONDS)))
+        await asyncio.sleep(delay)
+
+
+async def _run_auto_discovery() -> dict:
+    """Run one coalesced, read-first discovery pass and publish proven challenges."""
+    global _auto_discovery_lock, _last_auto_discovery
+    if not settings.AUTO_DISCOVERY:
+        return {'enabled': False, 'onboarded': [], 'quarantined': [], 'existing': []}
+    if _auto_discovery_lock is None:
+        _auto_discovery_lock = asyncio.Lock()
+    if _auto_discovery_lock.locked():
+        return {'enabled': True, 'coalesced': True, 'onboarded': [], 'quarantined': []}
+    async with _auto_discovery_lock:
+        rt = _runtime()
+        if rt.safety_work_pending():
+            return {
+                'enabled': True, 'paused_for_safety': True,
+                'onboarded': [], 'quarantined': [], 'existing': [],
+            }
+        # Discovery and balance/history refresh are both low-priority broker scans. Keep
+        # them off each other's account reads, and re-check safety after waiting for the
+        # shared background lane.
+        background_lock = rt._state_refresh_batch_lock
+        async with background_lock:
+            if rt.safety_work_pending():
+                return {
+                    'enabled': True, 'paused_for_safety': True,
+                    'onboarded': [], 'quarantined': [], 'existing': [],
+                }
+            result = await discover_and_onboard(
+                settings, rt.client, store, _accounts(),
+                publish_guard=lambda: not rt.safety_work_pending(),
+            )
+        if result.get('onboarded'):
+            rt.replace_accounts(_accounts())
+            logger.warning('Zero-touch account onboarding %s', result['onboarded'])
+        _last_auto_discovery = result
+        return result
+
+
+async def _auto_discovery_loop():
+    while True:
+        try:
+            rt = _runtime()
+            if not rt.safety_work_pending():
+                result = await _run_auto_discovery()
+                if result.get('quarantined'):
+                    logger.warning('Auto-discovery quarantined account(s) %s',
+                                   result['quarantined'])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('Auto-discovery pass failed')
+        await asyncio.sleep(max(
+            2.0, float(getattr(settings, 'AUTO_DISCOVERY_INTERVAL_SECONDS', 10.0))
+        ))
 
 
 @app.on_event('startup')
 async def _start_worker():
     global _worker_task, _control_worker_task, _worker_wakeup, _control_worker_wakeup
-    global _asw_reconcile_task, _entry_reconcile_task, _state_refresh_task
+    global _asw_reconcile_task, _entry_reconcile_task, _silver_management_task
+    global _state_refresh_task
+    global _auto_discovery_task
     store.recover_processing_webhooks()
     if store.unresolved_entry_attempt_count():
         store.trip_entry_circuit(
@@ -263,6 +355,12 @@ async def _start_worker():
         _webhook_worker(control=True), name='autoprop-control-worker'
     )
     _control_worker_wakeup.set()
+    try:
+        await _run_auto_discovery()
+    except Exception:
+        # Discovery is additive. A transient account-list failure must not prevent the
+        # already-configured accounts from warming and retaining protection/control.
+        logger.exception('Startup auto-discovery pass failed')
     try:
         primed = await asyncio.wait_for(
             _runtime().refresh_state_cache(),
@@ -288,8 +386,14 @@ async def _start_worker():
     _entry_reconcile_task = asyncio.create_task(
         _entry_reconcile_loop(), name='autoprop-entry-reconcile'
     )
+    _silver_management_task = asyncio.create_task(
+        _silver_management_loop(), name='autoprop-silver-management'
+    )
     _state_refresh_task = asyncio.create_task(
         _state_refresh_loop(), name='autoprop-state-refresh'
+    )
+    _auto_discovery_task = asyncio.create_task(
+        _auto_discovery_loop(), name='autoprop-auto-discovery'
     )
     _worker_wakeup.set()
 
@@ -297,10 +401,13 @@ async def _start_worker():
 @app.on_event('shutdown')
 async def _stop_worker():
     global _worker_task, _control_worker_task, _asw_reconcile_task
-    global _entry_reconcile_task, _state_refresh_task, _runtime_instance
+    global _entry_reconcile_task, _silver_management_task
+    global _state_refresh_task, _auto_discovery_task
+    global _runtime_instance, _auto_discovery_lock
     global _worker_wakeup, _control_worker_wakeup
     tasks = [_worker_task, _control_worker_task, _asw_reconcile_task,
-             _entry_reconcile_task, _state_refresh_task]
+             _entry_reconcile_task, _silver_management_task,
+             _state_refresh_task, _auto_discovery_task]
     for task in tasks:
         if task is not None:
             task.cancel()
@@ -315,7 +422,10 @@ async def _stop_worker():
     _control_worker_task = None
     _asw_reconcile_task = None
     _entry_reconcile_task = None
+    _silver_management_task = None
     _state_refresh_task = None
+    _auto_discovery_task = None
+    _auto_discovery_lock = None
     _worker_wakeup = None
     _control_worker_wakeup = None
     if _runtime_instance is not None:
@@ -324,7 +434,19 @@ async def _stop_worker():
 
 
 def _accounts():
-    return load_accounts(settings.ACCOUNT_CONFIG_PATH, settings.ACCOUNT_CONFIG_JSON)
+    configured = load_accounts(settings.ACCOUNT_CONFIG_PATH, settings.ACCOUNT_CONFIG_JSON)
+    # Explicit configuration always wins. Auto-onboarded accounts are a durable overlay
+    # stored on the Railway volume so no environment-variable edit is required.
+    seen_ids = {rule.account_id for rule in configured}
+    seen_names = {rule.crosstrade_account for rule in configured}
+    merged = list(configured)
+    for rule in store.all_auto_accounts():
+        if rule.account_id in seen_ids or rule.crosstrade_account in seen_names:
+            continue
+        merged.append(rule)
+        seen_ids.add(rule.account_id)
+        seen_names.add(rule.crosstrade_account)
+    return merged
 
 
 def _seed_env_risk_states():
@@ -362,12 +484,17 @@ def _linked_account_names(payload):
 def health():
     accounts = _accounts()
     base = readiness(settings, accounts)
+    auto_onboarding_enabled = bool(
+        settings.AUTO_DISCOVERY
+        and getattr(settings, 'AUTO_ONBOARD_VERIFIED_CHALLENGE_COHORTS', True)
+    )
     try:
         execution_symbol = normalize_tradovate_symbol(settings.DEFAULT_EXECUTION_SYMBOL)
     except InstrumentContractError:
         execution_symbol = 'INVALID'
     circuit = store.entry_circuit()
     unresolved = store.unresolved_entry_attempt_count()
+    silver_intent = store.silver_stop_intent()
     return {
         'ok': True,
         'version': __version__,
@@ -377,8 +504,14 @@ def health():
         'tradingview_alert_contract_verified': settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED,
         'configuration_ready': base['configuration_ready'],
         'broker_mutation_armed': (base['broker_mutation_armed']
-                                  and not circuit.get('open') and unresolved == 0),
+                                  and not circuit.get('open') and unresolved == 0
+                                  and not silver_intent),
         'registered_accounts': len(accounts),
+        'auto_discovery_enabled': bool(settings.AUTO_DISCOVERY),
+        'auto_onboarding_enabled': auto_onboarding_enabled,
+        'auto_onboarding_policy': 'verified_challenge_cohort_or_known_profile',
+        'fundednext_default_model': str(settings.FUNDEDNEXT_DEFAULT_MODEL),
+        'auto_onboarded_accounts': len(store.all_auto_accounts()),
         'active_trades': len(store.all_trades()),
         'asw_limit_contract': 'ASW_LIMIT_V1',
         'silver_stop_contract': SILVER_STOP_CONTRACT,
@@ -386,6 +519,8 @@ def health():
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
         'unresolved_entry_attempts': unresolved,
+        'silver_management_pending': bool(silver_intent),
+        'silver_management_stage': int(silver_intent.get('stage') or 0),
     }
 
 
@@ -438,10 +573,20 @@ async def live_readiness(token: str):
             'entry_circuit_open': bool(circuit.get('open')),
             'entry_circuit_reason': str(circuit.get('reason') or ''),
             'unresolved_entry_attempts': unresolved,
+            'silver_management_pending': bool(store.silver_stop_intent()),
+            'silver_management_stage': int(
+                (store.silver_stop_intent() or {}).get('stage') or 0
+            ),
         }
     wave_marker = getattr(rt, 'entry_wave_active', None)
     if wave_marker is not None and wave_marker.is_set():
         raise HTTPException(409, 'entry wave active; retry readiness after dispatch')
+    if getattr(rt, 'safety_work_pending', lambda: False)():
+        raise HTTPException(
+            409,
+            'safety-critical reconciliation/management active; use /health and retry '
+            'live-readiness after positions are flat',
+        )
     states = []
     state_problems = []
     discovery_warnings = []
@@ -502,9 +647,17 @@ async def live_readiness(token: str):
         except Exception as exc:
             return (None, [f'{a.account_id}: {exc}'])
 
-    inspected = await asyncio.gather(*(
-        inspect_account(a) for a in accounts if a.enabled
-    ))
+    # Diagnostics are low-priority and must never enqueue a fleet-wide GET fanout that can
+    # sit ahead of entry reconciliation or protection management.
+    inspected = []
+    for account in accounts:
+        if not account.enabled:
+            continue
+        if getattr(rt, 'safety_work_pending', lambda: False)():
+            raise HTTPException(
+                409, 'safety-critical broker work started during readiness; retry when flat'
+            )
+        inspected.append(await inspect_account(account))
     for state_row, account_problems in inspected:
         if state_row is not None:
             states.append(state_row)
@@ -533,6 +686,10 @@ async def live_readiness(token: str):
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
         'unresolved_entry_attempts': unresolved,
+        'silver_management_pending': bool(store.silver_stop_intent()),
+        'silver_management_stage': int(
+            (store.silver_stop_intent() or {}).get('stage') or 0
+        ),
     }
 
 
@@ -542,6 +699,9 @@ async def discovery(token: str):
     rt = _runtime()
     if rt.entry_wave_active.is_set():
         raise HTTPException(409, 'entry wave active; retry discovery after dispatch')
+    if getattr(rt, 'safety_work_pending', lambda: False)():
+        raise HTTPException(409, 'safety-critical broker work active; retry discovery later')
+    scan = await _run_auto_discovery()
     payload = await rt.client.list_accounts()
     linked = sorted(_linked_account_names(payload))
     configured = {a.crosstrade_account: a.account_id for a in _accounts()}
@@ -550,6 +710,11 @@ async def discovery(token: str):
         'configured_accounts': configured,
         'unconfigured_linked_accounts': [x for x in linked if x not in configured],
         'missing_linked_accounts': [name for name in configured if name not in linked],
+        'zero_touch_scan': scan,
+        'auto_onboarded_accounts': [
+            rule.model_dump() for rule in store.all_auto_accounts()
+        ],
+        'auto_discovery_audit': store.all_auto_discovery_audit(),
     }
 
 
@@ -594,6 +759,8 @@ async def reset_entry_circuit(token: str):
         raise HTTPException(409, 'unresolved entry attempts must be reconciled first')
     if store.all_trades() or store.all_asw_pending():
         raise HTTPException(409, 'managed trades/pending limits must be flat first')
+    if store.silver_stop_intent():
+        raise HTTPException(409, 'Silver protection intent must finish before circuit reset')
     rt = _runtime()
     wave_marker = getattr(rt, 'entry_wave_active', None)
     if wave_marker is not None and wave_marker.is_set():
@@ -717,6 +884,11 @@ async def webhook(token: str, request: Request):
             'reason': 'prior entry attempt is unresolved',
             'unresolved_entry_attempts': store.unresolved_entry_attempt_count(),
         })
+    if new_risk and store.silver_stop_intent():
+        raise HTTPException(503, {
+            'reason': 'Silver protection intent is pending',
+            'silver_stop_intent': store.silver_stop_intent(),
+        })
 
     base = readiness(settings, _accounts()) if new_risk else None
     if new_risk and base is not None and not base['configuration_ready']:
@@ -731,7 +903,7 @@ async def webhook(token: str, request: Request):
     control_kinds = {'EXIT', 'HARD_FLAT', 'ASW_CANCEL_PENDING', 'ASW_TIME_FLAT'}
     priority = {
         'HARD_FLAT': 100, 'ASW_TIME_FLAT': 100, 'ASW_CANCEL_PENDING': 95,
-        'EXIT': 90, 'SILVER_STOP_MOVE': 10, 'MARKET_PULSE': 10,
+        'EXIT': 90, 'SILVER_STOP_MOVE': 80, 'MARKET_PULSE': 10,
         'ENTRY': 10, 'ASW_WORKING_LIMIT': 10,
     }.get(event.kind, 10)
     if event.kind in control_kinds:

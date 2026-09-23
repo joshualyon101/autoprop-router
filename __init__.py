@@ -1,1 +1,1 @@
-__version__ = "1.2.8.6-exact-parity-core-normalization-race-hotfix-rc1"
+__version__ = "1.2.8.9-exact-parity-priority-management-rc1"

@@ -540,7 +540,7 @@ async def test_management_flat_path_defers_until_owned_orders_terminal(
             "AUTOPROP_ICT_FUSION|SILVER|MOVE_STOP|LONG|"
             "CONTRACT=SILVER_SB35_STAGE_V1|STAGE=1|LOCK_R=0.25|TRIGGER_R=2"
         )
-        handler = router.silver_stop
+        handler = lambda _event: router._apply_silver_stage(1)
 
     first = await handler(event)
 

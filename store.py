@@ -7,7 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from models import ActiveTrade, VerifiedRiskState, AswPending, AccountState, EntryAttempt
+from models import (ActiveTrade, VerifiedRiskState, AswPending, AccountState,
+                    EntryAttempt, AccountRule)
 
 
 class Store:
@@ -49,6 +50,21 @@ class Store:
             c.execute("CREATE TABLE IF NOT EXISTS risk_state (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS asw_pending (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS cached_account_state (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS auto_accounts (
+                account_id TEXT PRIMARY KEY,
+                crosstrade_account TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS auto_discovery_audit (
+                crosstrade_account TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS entry_attempts (
                 attempt_key TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL,
@@ -716,6 +732,119 @@ class Store:
             ).fetchone()
         return int(row[0] if row else 0)
 
+    def record_silver_stop_intent(self, stage: int, event_key: str = '') -> dict:
+        """Durably coalesce Silver protection requests to the highest pending stage."""
+        stage = int(stage)
+        if stage not in {1, 2}:
+            raise ValueError(f'unsupported Silver protection stage {stage}')
+        now = time.time()
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='silver_stop_intent'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            was_pending = bool(current.get('pending'))
+            current_stage = int(current.get('stage') or 0) if was_pending else 0
+            raised = stage > current_stage or not was_pending
+            payload = {
+                'pending': True,
+                'stage': max(stage, current_stage),
+                'event_key': str(event_key or current.get('event_key') or ''),
+                'recorded_at_epoch': (now if not was_pending else float(
+                    current.get('recorded_at_epoch') or now
+                )),
+                'updated_at_epoch': now,
+                'attempts': (0 if raised else int(current.get('attempts') or 0)),
+                'next_attempt_at_epoch': (0.0 if raised else float(
+                    current.get('next_attempt_at_epoch') or 0.0
+                )),
+                'last_error': ('' if raised else str(current.get('last_error') or '')),
+            }
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('silver_stop_intent',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(payload, default=str),),
+            )
+            conn.commit()
+            return payload
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def silver_stop_intent(self) -> dict:
+        payload = self.get_runtime_state('silver_stop_intent') or {}
+        return payload if payload.get('pending') else {}
+
+    def defer_silver_stop_intent(self, stage: int, reason: str,
+                                 delay_seconds: float) -> dict:
+        """Back off one service pass without losing a newer coalesced stage."""
+        now = time.time()
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='silver_stop_intent'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if not current.get('pending'):
+                conn.rollback()
+                return {}
+            # A stage-2 alert may arrive while stage 1 is being serviced. Preserve its
+            # immediate eligibility instead of applying the older pass's backoff.
+            if int(current.get('stage') or 0) > int(stage):
+                conn.rollback()
+                return current
+            current.update({
+                'attempts': int(current.get('attempts') or 0) + 1,
+                'next_attempt_at_epoch': now + max(0.05, float(delay_seconds)),
+                'updated_at_epoch': now,
+                'last_error': str(reason)[:2000],
+            })
+            conn.execute(
+                "UPDATE runtime_state SET payload=? WHERE key='silver_stop_intent'",
+                (json.dumps(current, default=str),),
+            )
+            conn.commit()
+            return current
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def clear_silver_stop_intent(self, serviced_stage: int) -> bool:
+        """Clear only if no newer stage arrived during the service pass."""
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='silver_stop_intent'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if (not current.get('pending')
+                    or int(current.get('stage') or 0) > int(serviced_stage)):
+                conn.rollback()
+                return False
+            current.update({
+                'pending': False, 'completed_at_epoch': time.time(),
+                'next_attempt_at_epoch': 0.0, 'last_error': '',
+            })
+            conn.execute(
+                "UPDATE runtime_state SET payload=? WHERE key='silver_stop_intent'",
+                (json.dumps(current, default=str),),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def save_org_attempt(self, account_id: str, payload: dict):
         with self.db() as c:
             c.execute("INSERT INTO org_attempts(account_id,payload) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET payload=excluded.payload",
@@ -772,6 +901,115 @@ class Store:
         with self.db() as c:
             rows = c.execute("SELECT payload FROM risk_state").fetchall()
         return [VerifiedRiskState.model_validate_json(r[0]) for r in rows]
+
+    def commit_auto_onboarded_account(
+            self, rule: AccountRule, risk: VerifiedRiskState,
+            state: AccountState, evidence: dict) -> bool:
+        """Durably publish one proven-new account and its complete entry state.
+
+        The account does not become visible to routing until its rule, verified initial
+        MLL, and fresh empty-ledger cache can be committed together.  Repeated discovery
+        of the same CrossTrade account is idempotent; identity conflicts fail closed.
+        """
+        if rule.account_id != risk.account_id or rule.account_id != state.account_id:
+            raise ValueError('auto-onboarding account identity mismatch')
+        if not rule.enabled or not rule.rules_verified:
+            raise ValueError('auto-onboarded account must be enabled and rules verified')
+        if not risk.mll_verified or risk.mll_floor is None:
+            raise ValueError('auto-onboarded prop account requires verified initial MLL')
+        if not state.mll_verified or state.mll_floor is None:
+            raise ValueError('auto-onboarded account state requires verified MLL')
+        rule_payload = rule.model_dump_json()
+        risk_payload = risk.model_dump_json()
+        state_payload = state.model_dump_json()
+        evidence_payload = json.dumps(evidence, default=str, sort_keys=True)
+        conn = self._connect(timeout=10.0)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            by_id = conn.execute(
+                'SELECT crosstrade_account,payload FROM auto_accounts WHERE account_id=?',
+                (rule.account_id,),
+            ).fetchone()
+            by_name = conn.execute(
+                'SELECT account_id,payload FROM auto_accounts WHERE crosstrade_account=?',
+                (rule.crosstrade_account,),
+            ).fetchone()
+            if by_id is not None and str(by_id[0]) != rule.crosstrade_account:
+                raise ValueError('auto-onboarding account_id collision')
+            if by_name is not None and str(by_name[0]) != rule.account_id:
+                raise ValueError('auto-onboarding CrossTrade-name collision')
+            inserted = by_id is None and by_name is None
+            conn.execute(
+                'INSERT INTO risk_state(account_id,payload) VALUES(?,?) '
+                'ON CONFLICT(account_id) DO UPDATE SET payload=excluded.payload',
+                (risk.account_id, risk_payload),
+            )
+            conn.execute(
+                'INSERT INTO cached_account_state(account_id,payload) VALUES(?,?) '
+                'ON CONFLICT(account_id) DO UPDATE SET payload=excluded.payload',
+                (state.account_id, state_payload),
+            )
+            conn.execute(
+                'INSERT INTO auto_accounts(account_id,crosstrade_account,payload,evidence) '
+                'VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET '
+                'crosstrade_account=excluded.crosstrade_account,payload=excluded.payload,'
+                'evidence=excluded.evidence,updated_at=CURRENT_TIMESTAMP',
+                (rule.account_id, rule.crosstrade_account, rule_payload, evidence_payload),
+            )
+            conn.execute(
+                'INSERT INTO auto_discovery_audit('
+                'crosstrade_account,status,reason,payload) VALUES(?,?,?,?) '
+                'ON CONFLICT(crosstrade_account) DO UPDATE SET '
+                'status=excluded.status,reason=excluded.reason,payload=excluded.payload,'
+                'updated_at=CURRENT_TIMESTAMP',
+                (rule.crosstrade_account, 'ONBOARDED', '', evidence_payload),
+            )
+            conn.commit()
+            return inserted
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def all_auto_accounts(self) -> list[AccountRule]:
+        with self.db() as c:
+            rows = c.execute(
+                'SELECT payload FROM auto_accounts ORDER BY created_at,account_id'
+            ).fetchall()
+        return [AccountRule.model_validate_json(row[0]) for row in rows]
+
+    def save_auto_discovery_audit(self, crosstrade_account: str, *, status: str,
+                                  reason: str, payload: dict | None = None) -> None:
+        with self.db() as c:
+            c.execute(
+                'INSERT INTO auto_discovery_audit('
+                'crosstrade_account,status,reason,payload) VALUES(?,?,?,?) '
+                'ON CONFLICT(crosstrade_account) DO UPDATE SET '
+                'status=excluded.status,reason=excluded.reason,payload=excluded.payload,'
+                'updated_at=CURRENT_TIMESTAMP',
+                (str(crosstrade_account), str(status), str(reason)[:2000],
+                 json.dumps(payload or {}, default=str, sort_keys=True)),
+            )
+
+    def all_auto_discovery_audit(self) -> list[dict]:
+        with self.db() as c:
+            rows = c.execute(
+                'SELECT crosstrade_account,status,reason,payload,updated_at '
+                'FROM auto_discovery_audit ORDER BY crosstrade_account'
+            ).fetchall()
+        out = []
+        for name, status, reason, payload, updated_at in rows:
+            try:
+                detail = json.loads(payload)
+            except Exception:
+                detail = {}
+            out.append({
+                'crosstrade_account': str(name), 'status': str(status),
+                'reason': str(reason), 'detail': detail,
+                'updated_at': str(updated_at),
+            })
+        return out
 
 
     def enqueue_webhook(self, event_key: str, raw: str, kind: str, *,

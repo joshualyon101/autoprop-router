@@ -46,6 +46,8 @@ class LiveRouter:
         self.accounts = accounts
         self.store = store
         self.entry_wave_active = asyncio.Event()
+        self.silver_management_wakeup = asyncio.Event()
+        self._entry_reconcile_lock = asyncio.Lock()
         self._state_refresh_locks: dict[str, asyncio.Lock] = {}
         self._state_refresh_batch_lock = asyncio.Lock()
         self.client = CrossTradeClient(
@@ -73,6 +75,27 @@ class LiveRouter:
                                  bracket_confirm_delay=settings.BRACKET_CONFIRM_RETRY_DELAY_SECONDS,
                                  change_retries=settings.MANAGEMENT_CHANGE_RETRIES,
                                  change_delay=settings.MANAGEMENT_CHANGE_RETRY_DELAY_SECONDS)
+
+    def replace_accounts(self, accounts: list[AccountRule]) -> None:
+        """Atomically publish a new immutable account-list snapshot for future work."""
+        self.accounts = list(accounts)
+
+    def safety_work_pending(self) -> bool:
+        """True while broker read capacity must be reserved for exposure management."""
+        if getattr(self, 'entry_wave_active', None) is not None:
+            if self.entry_wave_active.is_set():
+                return True
+        unresolved_fn = getattr(self.store, 'unresolved_entry_attempt_count', None)
+        if unresolved_fn is not None and unresolved_fn():
+            return True
+        trades_fn = getattr(self.store, 'all_trades', None)
+        if trades_fn is not None and trades_fn():
+            return True
+        pending_fn = getattr(self.store, 'all_asw_pending', None)
+        if pending_fn is not None and pending_fn():
+            return True
+        intent_fn = getattr(self.store, 'silver_stop_intent', None)
+        return bool(intent_fn is not None and intent_fn())
 
     @staticmethod
     def _position_identity(row: dict[str, Any]) -> tuple[str, str]:
@@ -194,6 +217,9 @@ class LiveRouter:
         if lock.locked():
             return {'coalesced': True, 'results': []}
 
+        if self.safety_work_pending():
+            return {'paused_for_safety': True, 'results': []}
+
         async def refresh(rule: AccountRule) -> dict:
             if not rule.enabled:
                 return {'account_id': rule.account_id, 'status': 'DISABLED'}
@@ -231,8 +257,22 @@ class LiveRouter:
                         'reason': text}
             except Exception as exc:
                 return {'account_id': rule.account_id, 'status': 'ERROR', 'reason': str(exc)}
+        # Do not enqueue an eight-account background GET wave behind the global semaphore.
+        # One account at a time leaves at most one low-priority read in flight when an
+        # entry, reconciliation, EXIT, or protection request becomes safety-critical.
+        results = []
         async with lock:
-            return {'results': await asyncio.gather(*(refresh(rule) for rule in self.accounts))}
+            for rule in list(self.accounts):
+                if self.safety_work_pending():
+                    results.append({
+                        'account_id': rule.account_id,
+                        'status': 'PAUSED_FOR_SAFETY',
+                    })
+                    break
+                results.append(await refresh(rule))
+        return {'paused_for_safety': any(
+                    row.get('status') == 'PAUSED_FOR_SAFETY' for row in results
+                ), 'results': results}
 
     async def org_history(self, rule: AccountRule) -> list[dict]:
         now = datetime.now(timezone.utc)
@@ -1126,6 +1166,10 @@ class LiveRouter:
         """Prepare all accounts, dispatch one tight mutation wave, verify asynchronously."""
         if event.plan is None:
             raise ValueError('ENTRY missing canonical plan')
+        # Zero-touch discovery may publish a new list while this coroutine is awaiting
+        # broker I/O. One signal must use one stable destination set from preflight through
+        # result construction; a newly onboarded account joins the following signal.
+        accounts = tuple(self.accounts)
         now = datetime.now(timezone.utc)
         receipt_epoch = time.time() if receipt_epoch is None else float(receipt_epoch)
         event_key = event_key or event.plan.event_id
@@ -1140,7 +1184,7 @@ class LiveRouter:
                         {'account_id': rule.account_id,
                          'status': 'SKIP' if not rule.enabled else 'ERROR',
                          'reason': 'disabled' if not rule.enabled else reason}
-                        for rule in self.accounts
+                        for rule in accounts
                     ], 'entry_circuit_open': True}
         if self.store.unresolved_entry_attempt_count():
             reason = 'prior entry wave is still awaiting broker reconciliation'
@@ -1149,7 +1193,7 @@ class LiveRouter:
                         {'account_id': rule.account_id,
                          'status': 'SKIP' if not rule.enabled else 'ABORTED',
                          'reason': 'disabled' if not rule.enabled else reason}
-                        for rule in self.accounts
+                        for rule in accounts
                     ]}
         if time.time() > deadline:
             reason = 'entry signal expired before preflight'
@@ -1158,7 +1202,7 @@ class LiveRouter:
                         {'account_id': rule.account_id,
                          'status': 'SKIP' if not rule.enabled else 'ABORTED',
                          'reason': 'disabled' if not rule.enabled else reason}
-                        for rule in self.accounts
+                        for rule in accounts
                     ]}
 
         # Production uses one all-account snapshot. Assigned test doubles from prior releases
@@ -1175,7 +1219,7 @@ class LiveRouter:
                         {'account_id': rule.account_id,
                          'status': 'SKIP' if not rule.enabled else 'ERROR',
                          'reason': 'disabled' if not rule.enabled else reason}
-                        for rule in self.accounts
+                        for rule in accounts
                     ], 'global_execution_error': reason}
 
         unresolved_accounts = {
@@ -1232,7 +1276,7 @@ class LiveRouter:
             except (StateUnverified, CrossTradeError, ProtectionFailure, ValueError) as exc:
                 return None, None, f'{rule.account_id}: {exc}'
 
-        prepared_rows = await asyncio.gather(*(prepare(rule) for rule in self.accounts))
+        prepared_rows = await asyncio.gather(*(prepare(rule) for rule in accounts))
         for item, row, fatal in prepared_rows:
             if row is not None:
                 result_by_account[row['account_id']] = row
@@ -1244,13 +1288,13 @@ class LiveRouter:
             reason = f'entry batch preparation failed before broker mutation: {fatal_preparation}'
             self.store.trip_entry_circuit(reason=reason, event_key=event_key,
                                           outcome='PREPARATION_FAILED')
-            for rule in self.accounts:
+            for rule in accounts:
                 if rule.enabled and rule.account_id not in result_by_account:
                     result_by_account[rule.account_id] = {
                         'account_id': rule.account_id, 'status': 'ERROR', 'reason': reason,
                     }
             return {'kind': 'ENTRY', 'engine': event.plan.engine,
-                    'results': [result_by_account[r.account_id] for r in self.accounts],
+                    'results': [result_by_account[r.account_id] for r in accounts],
                     'global_execution_error': reason}
 
         attempt_candidates: list[tuple[AccountRule, Allocation, EntryAttempt]] = []
@@ -1570,7 +1614,7 @@ class LiveRouter:
                               + global_instrument_error,
                 }
 
-        rows = [result_by_account[rule.account_id] for rule in self.accounts]
+        rows = [result_by_account[rule.account_id] for rule in accounts]
         errors = [r for r in rows if r.get('status') in {'ERROR', 'FLATTENED'}]
         if errors:
             common = str(errors[0].get('reason') or errors[0].get('status'))
@@ -1715,6 +1759,15 @@ class LiveRouter:
                 'child_orders': len(updated.child_order_ids)}
 
     async def reconcile_entry_attempts(self) -> dict:
+        """Serialize safety-critical readback across the periodic and management loops."""
+        lock = getattr(self, '_entry_reconcile_lock', None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._entry_reconcile_lock = lock
+        async with lock:
+            return await self._reconcile_entry_attempts_once()
+
+    async def _reconcile_entry_attempts_once(self) -> dict:
         """Confirm accepted exposure off the submit path using fill-reconciled state."""
         now_epoch = time.time()
         timeout = float(getattr(self.settings, 'ENTRY_RECONCILE_TIMEOUT_SECONDS', 30.0))
@@ -2134,13 +2187,37 @@ class LiveRouter:
             })
         return out
 
-    async def silver_stop(self, event: ParsedEvent) -> dict:
-        attempts_fn = getattr(self.store, 'all_entry_attempts', None)
-        unresolved = (attempts_fn(('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING'))
-                      if attempts_fn is not None else [])
-        if any(a.engine == 'SILVER' for a in unresolved):
-            return {'kind': 'SILVER_STOP_MOVE', 'deferred': True,
-                    'reason': 'SILVER entry is awaiting broker reconciliation'}
+    async def silver_stop(self, event: ParsedEvent, *, event_key: str = '') -> dict:
+        """Persist the highest requested stage; a dedicated loop owns broker mutation.
+
+        The webhook inbox is therefore completed exactly once instead of accumulating
+        hundreds of retries while an accepted entry is still becoming ACTIVE.
+        """
+        fields = event.fields or {}
+        try:
+            stage = int(float(fields.get('STAGE', '0')))
+        except (TypeError, ValueError) as exc:
+            raise ProtectionFailure('Silver staged stop event missing valid STAGE') from exc
+        if stage not in {1, 2}:
+            raise ProtectionFailure(f'unsupported Silver protection stage {stage}')
+        record = getattr(self.store, 'record_silver_stop_intent', None)
+        if record is None:
+            # Compatibility for isolated unit fakes. Production Store always supplies the
+            # durable intent API.
+            return await self._apply_silver_stage(stage)
+        intent = record(stage, event_key)
+        wakeup = getattr(self, 'silver_management_wakeup', None)
+        if wakeup is not None:
+            wakeup.set()
+        return {
+            'kind': 'SILVER_STOP_MOVE',
+            'status': 'INTENT_RECORDED',
+            'stage': int(intent['stage']),
+            'coalesced': int(intent['stage']) > stage,
+        }
+
+    async def _apply_silver_stage(self, stage: int) -> dict:
+        """Apply one stage to every ACTIVE Silver destination independently."""
         rule_map = {a.account_id: a for a in self.accounts}
         results = []
         for trade in self.store.all_trades():
@@ -2148,6 +2225,13 @@ class LiveRouter:
                 continue
             rule = rule_map.get(trade.account_id)
             if rule is None or not rule.enabled:
+                continue
+            if int(trade.stop_stage or 0) >= int(stage):
+                results.append({
+                    'account_id': rule.account_id, 'status': 'NO_CHANGE',
+                    'stage': stage,
+                    'reason': f'SILVER_STAGE_{stage}_ALREADY_APPLIED',
+                })
                 continue
             try:
                 signed = await self.position_qty(rule)
@@ -2160,11 +2244,6 @@ class LiveRouter:
                     continue
                 trade.previous_position_qty = trade.current_position_qty
                 trade.current_position_qty = abs(signed)
-                fields = event.fields or {}
-                try:
-                    stage = int(float(fields.get('STAGE', '0')))
-                except (TypeError, ValueError):
-                    raise ProtectionFailure('Silver staged stop event missing valid STAGE')
                 decision = silver_lock_stop(trade, stage)
                 if decision.new_stop is None:
                     trade.stop_stage = max(int(trade.stop_stage or 0), stage)
@@ -2188,13 +2267,73 @@ class LiveRouter:
                 )
                 row.setdefault('reason', str(exc))
                 results.append(row)
-        out = {'kind': 'SILVER_STOP_MOVE', 'results': results}
+        out = {'kind': 'SILVER_STOP_SERVICE', 'stage': stage, 'results': results}
         if any(row.get('status') == 'ERROR' for row in results):
             out.update({
                 'deferred': True,
-                'reason': 'SILVER management remains unconfirmed; retrying flat proof',
+                'reason': 'SILVER management remains unconfirmed; durable intent retained',
             })
         return out
+
+    async def service_silver_stop_intent(self) -> dict:
+        """Promote eligible entries, manage ACTIVE accounts, and retain work until proven."""
+        get_intent = getattr(self.store, 'silver_stop_intent', None)
+        if get_intent is None:
+            return {'kind': 'SILVER_STOP_SERVICE', 'status': 'UNSUPPORTED'}
+        intent = get_intent()
+        if not intent:
+            return {'kind': 'SILVER_STOP_SERVICE', 'status': 'IDLE'}
+        now = time.time()
+        if float(intent.get('next_attempt_at_epoch') or 0.0) > now:
+            return {'kind': 'SILVER_STOP_SERVICE', 'status': 'BACKOFF'}
+        stage = int(intent['stage'])
+        reconciliation_error = ''
+        attempts_fn = getattr(self.store, 'all_entry_attempts', None)
+        unresolved = (attempts_fn(('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING'))
+                      if attempts_fn is not None else [])
+        if any(a.engine == 'SILVER' for a in unresolved):
+            try:
+                await self.reconcile_entry_attempts()
+            except Exception as exc:
+                # Existing ACTIVE destinations must still receive their stage even when
+                # another account's readback is temporarily unavailable.
+                reconciliation_error = str(exc)
+
+        applied = await self._apply_silver_stage(stage)
+        unresolved = (attempts_fn(('PREPARED', 'SUBMITTING', 'ACCEPTED', 'FLATTENING'))
+                      if attempts_fn is not None else [])
+        silver_unresolved = [a for a in unresolved if a.engine == 'SILVER']
+        behind = [
+            trade for trade in self.store.all_trades()
+            if trade.engine == 'SILVER' and int(trade.stop_stage or 0) < stage
+        ]
+        errors = [
+            row for row in applied.get('results', []) if row.get('status') == 'ERROR'
+        ]
+        if silver_unresolved or behind or errors or reconciliation_error:
+            reasons = []
+            if silver_unresolved:
+                reasons.append(f'{len(silver_unresolved)} Silver entry attempt(s) unresolved')
+            if behind:
+                reasons.append(f'{len(behind)} active Silver trade(s) below stage {stage}')
+            if errors:
+                reasons.append(f'{len(errors)} destination management error(s)')
+            if reconciliation_error:
+                reasons.append(f'reconciliation error: {reconciliation_error}')
+            attempts = int(intent.get('attempts') or 0)
+            base = float(getattr(
+                self.settings, 'SILVER_MANAGEMENT_RETRY_BASE_SECONDS', 0.5
+            ))
+            maximum = float(getattr(
+                self.settings, 'SILVER_MANAGEMENT_RETRY_MAX_SECONDS', 5.0
+            ))
+            delay = min(maximum, base * (2 ** min(attempts, 4)))
+            self.store.defer_silver_stop_intent(stage, '; '.join(reasons), delay)
+            return {
+                **applied, 'status': 'PENDING', 'reason': '; '.join(reasons),
+            }
+        cleared = self.store.clear_silver_stop_intent(stage)
+        return {**applied, 'status': 'COMPLETED' if cleared else 'SUPERSEDED'}
 
     async def _hard_flat_rule_once(self, rule: AccountRule,
                                    trade: ActiveTrade | None,

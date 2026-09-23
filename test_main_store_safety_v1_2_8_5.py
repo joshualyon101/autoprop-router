@@ -289,7 +289,7 @@ def test_health_reports_open_circuit_and_unresolved_exposure(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_management_webhook_defers_and_requeues_until_entry_reconciles(
+async def test_management_webhook_records_durable_intent_without_retry_storm(
         monkeypatch, tmp_path):
     store = Store(str(tmp_path / "management.sqlite3"))
     assert store.create_entry_attempt(_attempt(engine="SILVER"))
@@ -319,36 +319,32 @@ async def test_management_webhook_defers_and_requeues_until_entry_reconciles(
         )
 
     monkeypatch.setattr(main, "_process_event", capture_process)
-    clock = [100.0]
-    monkeypatch.setattr(store_module.time, "time", lambda: clock[0])
-    deferred = asyncio.Event()
-    original_defer = store.defer_webhook
+    completed = asyncio.Event()
+    original_complete = store.complete_webhook
 
-    def record_defer(event_key, reason, delay_seconds=0.5):
-        original_defer(event_key, reason, delay_seconds)
-        deferred.set()
+    def record_complete(event_key, result):
+        original_complete(event_key, result)
+        completed.set()
 
-    monkeypatch.setattr(store, "defer_webhook", record_defer)
+    monkeypatch.setattr(store, "complete_webhook", record_complete)
     worker = asyncio.create_task(main._webhook_worker(control=False))
-    await asyncio.wait_for(deferred.wait(), timeout=1.0)
+    await asyncio.wait_for(completed.wait(), timeout=1.0)
     worker.cancel()
     with pytest.raises(asyncio.CancelledError):
         await worker
 
     rows = store.webhook_rows()
     assert len(rows) == 1
-    assert rows[0]["status"] == "PENDING"
+    assert rows[0]["status"] == "DONE"
     assert rows[0]["attempts"] == 1
-    assert "awaiting broker reconciliation" in rows[0]["last_error"]
+    assert rows[0]["last_error"] is None
+    assert rows[0]["result"]["status"] == "INTENT_RECORDED"
     assert seen_receipts == [0.0]
-
+    intent = store.silver_stop_intent()
+    assert intent["pending"] is True
+    assert intent["stage"] == 1
+    assert intent["event_key"] == "silver-management"
     assert store.claim_next_regular_webhook() is None
-    clock[0] = 101.0
-    reclaimed = store.claim_next_regular_webhook()
-    assert reclaimed is not None
-    assert reclaimed["event_key"] == "silver-management"
-    assert reclaimed["attempts"] == 2
-    assert reclaimed["receipt_epoch"] == 0.0
 
 
 def test_entry_attempt_cas_accepts_string_state_and_validates_before_update(tmp_path):
