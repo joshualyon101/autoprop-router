@@ -13,7 +13,7 @@ from crosstrade import (AmbiguousMutation, CrossTradeClient, CrossTradeError,
                         normalize_tradovate_symbol)
 from events import ParsedEvent
 from execution import (AcceptedOrderError, Executor, NormalizationMutationUnconfirmed,
-                       NormalizationSuperseded, ProtectionFailure,
+                       NormalizationReadbackPending, NormalizationSuperseded, ProtectionFailure,
                        verify_single_bracket)
 from management import core_on_market_pulse, silver_lock_stop
 from models import (AccountRule, AccountState, ActiveTrade, Allocation, AswPending,
@@ -53,6 +53,7 @@ class LiveRouter:
         self.client = CrossTradeClient(
             base_url=settings.CROSSTRADE_BASE_URL,
             token=settings.CROSSTRADE_TOKEN,
+            execution_mode=getattr(settings, 'AUTOPROP_EXECUTION_MODE', 'live'),
             timeout=settings.REQUEST_TIMEOUT_SECONDS,
             rate_limit_per_minute=settings.CROSSTRADE_RATE_LIMIT_PER_MINUTE,
             rate_limit_window_seconds=settings.CROSSTRADE_RATE_LIMIT_WINDOW_SECONDS,
@@ -1677,6 +1678,42 @@ class LiveRouter:
             return {'account_id': current.account_id,
                     'status': 'NORMALIZATION_SUPERSEDED',
                     'attempt_state': latest.state if latest else 'MISSING'}
+        except (NormalizationReadbackPending, CrossTradeError) as exc:
+            latest = self.store.get_entry_attempt(current.attempt_key)
+            if latest is None or latest.state != 'ACCEPTED':
+                return {'account_id': current.account_id,
+                        'status': 'NORMALIZATION_SUPERSEDED',
+                        'attempt_state': latest.state if latest else 'MISSING'}
+            reason = f'Core native ATM readback pending; position retained: {exc}'
+            scheduled = self.store.transition_entry_attempt(
+                latest.attempt_key, ('ACCEPTED',), 'ACCEPTED',
+                reconcile_attempts=int(latest.reconcile_attempts) + 1,
+                next_reconcile_at_epoch=time.time() + min(
+                    float(getattr(
+                        self.settings, 'ENTRY_RECONCILE_MAX_DELAY_SECONDS', 5.0
+                    )),
+                    float(getattr(
+                        self.settings, 'ENTRY_RECONCILE_BASE_DELAY_SECONDS', 0.75
+                    )) * (2 ** min(int(latest.reconcile_attempts), 8)),
+                ),
+                last_error=reason[:2000],
+            )
+            if scheduled is None:
+                advanced = self.store.get_entry_attempt(current.attempt_key)
+                return {'account_id': current.account_id,
+                        'status': 'NORMALIZATION_SUPERSEDED',
+                        'attempt_state': advanced.state if advanced else 'MISSING'}
+            # Stop every new entry while retaining the already accepted broker-hosted
+            # native ATM.  The attempt remains durable and retries with backoff; only
+            # affirmative unsafe topology may take the flatten path below.
+            self.store.trip_entry_circuit_for_attempt(
+                current.attempt_key, ('ACCEPTED',),
+                reason=f'{current.account_id}: {reason}',
+                outcome='CORE_NORMALIZATION_READBACK_PENDING',
+            )
+            return {'account_id': current.account_id,
+                    'status': 'CORE_NORMALIZATION_PENDING',
+                    'quarantined': True, 'reason': reason}
         except NormalizationMutationUnconfirmed as exc:
             latest = self.store.get_entry_attempt(current.attempt_key)
             if latest is None or latest.state != 'ACCEPTED':

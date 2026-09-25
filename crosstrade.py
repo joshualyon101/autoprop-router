@@ -15,6 +15,10 @@ class CrossTradeError(RuntimeError):
     pass
 
 
+class BrokerMutationDisabled(CrossTradeError):
+    """A non-GET broker request was blocked by the execution-mode firewall."""
+
+
 class AmbiguousMutation(CrossTradeError):
     """Network/5xx ambiguity where blindly resending could duplicate a live order."""
 
@@ -226,6 +230,10 @@ def _get_retry_delay(base: float, multiplier: float, maximum: float, attempt: in
 class CrossTradeClient:
     base_url: str
     token: str
+    # This is a transport-boundary safety control, not a UI/readiness label.  Any
+    # non-GET request is rejected before rate limiting or HTTP client creation while
+    # the client is in shadow mode.  Callers may still choose to issue read-only GETs.
+    execution_mode: str = "live"
     timeout: float = 4.0
     rate_limit_per_minute: int = 150
     rate_limit_window_seconds: float = 60.0
@@ -266,8 +274,13 @@ class CrossTradeClient:
                 await close()
 
     async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
-        url = self.base_url.rstrip("/") + path
         method_u = method.upper()
+        if method_u != "GET" and str(self.execution_mode).strip().lower() != "live":
+            raise BrokerMutationDisabled(
+                f"{method_u} {path} blocked: broker mutations are disabled in "
+                f"{self.execution_mode!r} execution mode"
+            )
+        url = self.base_url.rstrip("/") + path
         deadline_epoch = kwargs.pop("_deadline_epoch", None)
         admission_guard = kwargs.pop("_admission_guard", None)
         get_attempts = 0

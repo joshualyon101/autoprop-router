@@ -23,9 +23,19 @@ from store import Store
 from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 from management import SILVER_STOP_CONTRACT
 from onboarding import discover_and_onboard
+from shadow import ShadowObserver
 
 settings = Settings()
-store = Store(settings.SQLITE_PATH)
+_EXECUTION_MODE = str(settings.AUTOPROP_EXECUTION_MODE or '').strip().lower()
+_LIVE_MODE = _EXECUTION_MODE == 'live'
+_SHADOW_MODE = _EXECUTION_MODE == 'shadow'
+# Shadow observations must never recover or process durable live ownership rows.  A
+# separate database also makes a mode change explicit and keeps old live circuits from
+# blocking passive intake.
+store = Store(
+    str(getattr(settings, 'SHADOW_SQLITE_PATH', '/data/autoprop_router_shadow.sqlite3'))
+    if not _LIVE_MODE else settings.SQLITE_PATH
+)
 app = FastAPI(title='AutoProp Router', version=__version__)
 logger = logging.getLogger('autoprop.router')
 
@@ -41,6 +51,7 @@ _auto_discovery_task: asyncio.Task | None = None
 _auto_discovery_lock: asyncio.Lock | None = None
 _last_auto_discovery: dict = {}
 _runtime_instance: LiveRouter | None = None
+_shadow_instance: ShadowObserver | None = None
 
 
 
@@ -101,6 +112,10 @@ def _annotate_execution_result(result):
     return out
 
 async def _process_event(event, *, event_key: str = '', receipt_epoch: float | None = None):
+    if _SHADOW_MODE:
+        return await _shadow_runtime().observe(
+            event, event_key=event_key, receipt_epoch=receipt_epoch
+        )
     rt = _runtime()
     if event.kind == 'ENTRY':
         return await rt.route_entry(
@@ -136,8 +151,9 @@ async def _webhook_worker(*, control: bool = False):
         # following claim observes the durable row even though the hint was cleared.
         if wakeup is not None:
             wakeup.clear()
-        row = (store.claim_next_control_webhook() if control
-               else store.claim_next_regular_webhook())
+        row = (store.claim_next_webhook() if _SHADOW_MODE
+               else (store.claim_next_control_webhook() if control
+                     else store.claim_next_regular_webhook()))
         if row is None:
             if wakeup is None:
                 await asyncio.sleep(0.25)
@@ -152,16 +168,17 @@ async def _webhook_worker(*, control: bool = False):
             event = parse_alert(row['raw'])
             new_risk = event.kind in {'ENTRY', 'ASW_WORKING_LIMIT'}
             base = readiness(settings, _accounts()) if new_risk else None
-            if new_risk and not settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
-                raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
-            if new_risk and store.entry_circuit().get('open'):
-                raise RuntimeError(
-                    f"new-risk circuit open: {store.entry_circuit().get('reason') or 'reset required'}"
-                )
-            if new_risk and store.unresolved_entry_attempt_count():
-                raise RuntimeError('new-risk blocked: prior entry attempt is unresolved')
-            if new_risk and store.silver_stop_intent():
-                raise RuntimeError('new-risk blocked: Silver protection intent is pending')
+            if not _SHADOW_MODE:
+                if new_risk and not settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
+                    raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
+                if new_risk and store.entry_circuit().get('open'):
+                    raise RuntimeError(
+                        f"new-risk circuit open: {store.entry_circuit().get('reason') or 'reset required'}"
+                    )
+                if new_risk and store.unresolved_entry_attempt_count():
+                    raise RuntimeError('new-risk blocked: prior entry attempt is unresolved')
+                if new_risk and store.silver_stop_intent():
+                    raise RuntimeError('new-risk blocked: Silver protection intent is pending')
             if new_risk and base is not None and not base['configuration_ready']:
                 raise RuntimeError(f"router configuration not ready: {base['problems']}")
             result = _annotate_execution_result(await _process_event(
@@ -341,6 +358,24 @@ async def _start_worker():
     global _state_refresh_task
     global _auto_discovery_task
     store.recover_processing_webhooks()
+    if not _LIVE_MODE and not _SHADOW_MODE:
+        # Invalid roles fail inert: no inbox worker, no broker client, no recovery loop.
+        logger.error('Unsupported AUTOPROP_EXECUTION_MODE=%r; router remains inert',
+                     settings.AUTOPROP_EXECUTION_MODE)
+        return
+    if _SHADOW_MODE:
+        # A shadow process owns no broker state.  It runs one durable observation worker
+        # and deliberately omits every live control/reconciliation/management/read loop.
+        _worker_wakeup = asyncio.Event()
+        _control_worker_wakeup = None
+        _worker_task = asyncio.create_task(
+            _webhook_worker(control=False), name='autoprop-shadow-observer-worker'
+        )
+        _worker_wakeup.set()
+        logger.warning(
+            'AutoProp started as shadow_observer; broker mutations disabled and live loops skipped'
+        )
+        return
     if store.unresolved_entry_attempt_count():
         store.trip_entry_circuit(
             reason='process restarted with unresolved entry attempt(s); reconciliation required',
@@ -403,7 +438,7 @@ async def _stop_worker():
     global _worker_task, _control_worker_task, _asw_reconcile_task
     global _entry_reconcile_task, _silver_management_task
     global _state_refresh_task, _auto_discovery_task
-    global _runtime_instance, _auto_discovery_lock
+    global _runtime_instance, _shadow_instance, _auto_discovery_lock
     global _worker_wakeup, _control_worker_wakeup
     tasks = [_worker_task, _control_worker_task, _asw_reconcile_task,
              _entry_reconcile_task, _silver_management_task,
@@ -431,6 +466,7 @@ async def _stop_worker():
     if _runtime_instance is not None:
         await _runtime_instance.client.close()
         _runtime_instance = None
+    _shadow_instance = None
 
 
 def _accounts():
@@ -468,9 +504,20 @@ def _auth(token: str):
 
 def _runtime():
     global _runtime_instance
+    if _SHADOW_MODE:
+        raise RuntimeError('live runtime is unavailable in shadow mode')
     if _runtime_instance is None:
         _runtime_instance = LiveRouter(settings, _accounts(), store)
     return _runtime_instance
+
+
+def _shadow_runtime() -> ShadowObserver:
+    global _shadow_instance
+    if not _SHADOW_MODE:
+        raise RuntimeError('shadow observer is unavailable in live mode')
+    if _shadow_instance is None:
+        _shadow_instance = ShadowObserver(store, _accounts)
+    return _shadow_instance
 
 
 def _linked_account_names(payload):
@@ -495,20 +542,43 @@ def health():
     circuit = store.entry_circuit()
     unresolved = store.unresolved_entry_attempt_count()
     silver_intent = store.silver_stop_intent()
+    shadow_summary = store.get_runtime_state('shadow_observer_summary') or {}
+    shadow_last = shadow_summary.get('last_event') or {}
+    shadow_ready = bool(base.get('shadow_observation_ready', base['configuration_ready']))
+    broker_armed = False if _SHADOW_MODE else (
+        base['broker_mutation_armed'] and not circuit.get('open') and unresolved == 0
+        and not silver_intent
+    )
     return {
         'ok': True,
         'version': __version__,
         'execution_mode': settings.AUTOPROP_EXECUTION_MODE,
+        'router_role': 'shadow_observer' if _SHADOW_MODE else 'live_router',
+        'production_execution_path': (
+            'direct_tradingview_to_crosstrade' if _SHADOW_MODE
+            else 'tradingview_to_router_to_crosstrade'
+        ),
         'management_mode': settings.AUTOPROP_MANAGEMENT_MODE,
         'execution_symbol': execution_symbol,
         'tradingview_alert_contract_verified': settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED,
         'configuration_ready': base['configuration_ready'],
-        'broker_mutation_armed': (base['broker_mutation_armed']
-                                  and not circuit.get('open') and unresolved == 0
-                                  and not silver_intent),
+        'shadow_intake_ready': shadow_ready if _SHADOW_MODE else False,
+        'shadow_observation_ready': shadow_ready if _SHADOW_MODE else False,
+        'shadow_capability': 'alert_plan_observer' if _SHADOW_MODE else '',
+        'shadow_quantity_simulation': False,
+        'shadow_broker_reads_enabled': bool(
+            getattr(settings, 'SHADOW_BROKER_READS_ENABLED', False)
+        ) if _SHADOW_MODE else False,
+        'broker_mutation_capable': not _SHADOW_MODE,
+        'broker_mutation_armed': broker_armed,
+        'broker_mutation_firewall': bool(_SHADOW_MODE),
+        'broker_bracket_authority': (
+            'direct_crosstrade' if _SHADOW_MODE else 'router_managed'
+        ),
         'registered_accounts': len(accounts),
-        'auto_discovery_enabled': bool(settings.AUTO_DISCOVERY),
-        'auto_onboarding_enabled': auto_onboarding_enabled,
+        'auto_discovery_enabled': bool(settings.AUTO_DISCOVERY) and not _SHADOW_MODE,
+        'auto_discovery_configured': bool(settings.AUTO_DISCOVERY),
+        'auto_onboarding_enabled': auto_onboarding_enabled and not _SHADOW_MODE,
         'auto_onboarding_policy': 'verified_challenge_cohort_or_known_profile',
         'fundednext_default_model': str(settings.FUNDEDNEXT_DEFAULT_MODEL),
         'auto_onboarded_accounts': len(store.all_auto_accounts()),
@@ -521,6 +591,9 @@ def health():
         'unresolved_entry_attempts': unresolved,
         'silver_management_pending': bool(silver_intent),
         'silver_management_stage': int(silver_intent.get('stage') or 0),
+        'shadow_observed_events': int(shadow_summary.get('total_events') or 0),
+        'shadow_last_event_kind': str(shadow_last.get('kind') or ''),
+        'shadow_last_event_key': str(shadow_last.get('event_key') or ''),
     }
 
 
@@ -542,6 +615,11 @@ def accounts_admin(token: str):
 @app.get('/admin/live-readiness/{token}')
 async def live_readiness(token: str):
     _auth(token)
+    if _SHADOW_MODE:
+        raise HTTPException(
+            409,
+            'router role is shadow_observer; use /admin/shadow-readiness/{token}',
+        )
     accounts = _accounts()
     base = readiness(settings, accounts)
     runtime_problem = None
@@ -693,9 +771,47 @@ async def live_readiness(token: str):
     }
 
 
+@app.get('/admin/shadow-readiness/{token}')
+async def shadow_readiness(token: str):
+    """Report passive-intake readiness without contacting the broker."""
+    _auth(token)
+    if not _SHADOW_MODE:
+        raise HTTPException(409, 'router role is live_router; shadow intake is disabled')
+    base = readiness(settings, _accounts())
+    summary = store.get_runtime_state('shadow_observer_summary') or {}
+    last_event = summary.get('last_event') or {}
+    shadow_ready = bool(base.get('shadow_observation_ready', base['configuration_ready']))
+    return {
+        **base,
+        'router_role': 'shadow_observer',
+        'production_execution_path': 'direct_tradingview_to_crosstrade',
+        'shadow_intake_ready': shadow_ready,
+        'shadow_observation_ready': shadow_ready,
+        'shadow_capability': 'alert_plan_observer',
+        'shadow_quantity_simulation': False,
+        'broker_mutation_capable': False,
+        'broker_mutation_armed': False,
+        'broker_mutation_firewall': True,
+        'broker_bracket_authority': 'direct_crosstrade',
+        'shadow_broker_reads_enabled': bool(
+            getattr(settings, 'SHADOW_BROKER_READS_ENABLED', False)
+        ),
+        'shadow_database_path': store.path,
+        'shadow_observed_events': int(summary.get('total_events') or 0),
+        'shadow_last_event_kind': str(last_event.get('kind') or ''),
+        'shadow_last_event_key': str(last_event.get('event_key') or ''),
+        'live_circuit_gates_shadow_intake': False,
+    }
+
+
 @app.get('/admin/discovery/{token}')
 async def discovery(token: str):
     _auth(token)
+    if _SHADOW_MODE:
+        raise HTTPException(
+            409,
+            'broker discovery is disabled in shadow mode to protect the direct execution path',
+        )
     rt = _runtime()
     if rt.entry_wave_active.is_set():
         raise HTTPException(409, 'entry wave active; retry discovery after dispatch')
@@ -721,6 +837,11 @@ async def discovery(token: str):
 @app.get('/admin/dry-run/{token}')
 async def dry_run(token: str):
     _auth(token)
+    if _SHADOW_MODE:
+        result = await shadow_readiness(token)
+        result['dry_run'] = True
+        result['broker_mutation_performed'] = False
+        return result
     # Read-only broker/state pass. No order mutation and no synthetic strategy plan.
     result = await live_readiness(token)
     result['dry_run'] = True
@@ -753,6 +874,8 @@ def write_risk_state(token: str, body: RiskStateWrite):
 @app.post('/admin/entry-circuit/reset/{token}')
 async def reset_entry_circuit(token: str):
     _auth(token)
+    if _SHADOW_MODE:
+        raise HTTPException(409, 'shadow observer owns no live entry circuit')
     if settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
         raise HTTPException(409, 'disarm TRADINGVIEW_ALERT_CONTRACT_VERIFIED before reset')
     if store.unresolved_entry_attempt_count():
@@ -795,8 +918,8 @@ def storage(token: str):
                 pass
     files.sort(key=lambda x: x['bytes'], reverse=True)
     return {
-        'sqlite_path': settings.SQLITE_PATH,
-        'sqlite_bytes': Path(settings.SQLITE_PATH).stat().st_size if Path(settings.SQLITE_PATH).exists() else 0,
+        'sqlite_path': store.path,
+        'sqlite_bytes': Path(store.path).stat().st_size if Path(store.path).exists() else 0,
         'largest_files': files[:25],
         'sqlite_tables': store.table_inventory(),
     }
@@ -861,9 +984,64 @@ def entry_attempts(token: str, limit: int = 100):
     }
 
 
+@app.post('/webhook/tradingview-shadow/{token}')
+async def shadow_webhook(token: str, request: Request):
+    """Durably accept a parsed alert for passive observation only.
+
+    This route intentionally ignores the live alert gate, entry circuit, unresolved live
+    attempts, and Silver management state.  It never creates control fences or ownership
+    rows and is available only when the whole process booted as a shadow observer.
+    """
+    _auth(token)
+    if not _SHADOW_MODE:
+        raise HTTPException(409, 'shadow webhook is disabled while router role is live_router')
+    raw = (await request.body()).decode('utf-8').strip()
+    try:
+        event = parse_alert(raw)
+    except Exception as exc:
+        raise HTTPException(400, f'alert parse failed: {exc}')
+    base = readiness(settings, _accounts())
+    if not base['configuration_ready']:
+        raise HTTPException(503, {
+            'reason': 'shadow observer configuration not ready',
+            'problems': base['problems'],
+        })
+    receipt_epoch = time.time()
+    day = ny_date(datetime.now(timezone.utc))
+    # Pine's ordinary EXIT bodies do not carry a trade/time identifier.  A raw+day key
+    # would collapse two legitimate same-engine exits into one observation, so shadow
+    # intake records every successfully delivered alert.  Duplicate delivery is harmless
+    # because this lane cannot mutate the broker.
+    event_key = f"shadow:{stable_event_id(raw)}:{day}:{time.time_ns()}"
+    inserted = store.enqueue_webhook(
+        event_key, raw, event.kind, receipt_epoch=receipt_epoch,
+        priority=10, engine=event.engine, side=event.side,
+    )
+    if _worker_wakeup is not None:
+        _worker_wakeup.set()
+    return {
+        'accepted': True,
+        'queued': inserted,
+        'duplicate': not inserted,
+        'kind': event.kind,
+        'event_key': event_key,
+        'router_role': 'shadow_observer',
+        'broker_mutation_performed': False,
+        'tradingview_gate_required': False,
+        'live_circuit_gates_shadow_intake': False,
+    }
+
+
 @app.post('/webhook/tradingview/{token}')
 async def webhook(token: str, request: Request):
     _auth(token)
+    if _SHADOW_MODE:
+        raise HTTPException(409, {
+            'reason': 'live router webhook disabled in shadow mode',
+            'use': '/webhook/tradingview-shadow/{token}',
+        })
+    if not _LIVE_MODE:
+        raise HTTPException(503, 'router execution mode is invalid; webhook intake is inert')
     raw = (await request.body()).decode('utf-8').strip()
     try:
         event = parse_alert(raw)

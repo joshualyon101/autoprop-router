@@ -22,6 +22,16 @@ class NormalizationMutationUnconfirmed(ProtectionFailure):
     """A Core child CHANGE was attempted but its final broker outcome is unsafe."""
 
 
+class NormalizationReadbackPending(ProtectionFailure):
+    """Core ATM readback is unknown while native broker protection remains in force.
+
+    This exception is deliberately distinct from affirmative unsafe topology.  A
+    lifecycle timeout or a delayed CHANGE report is not evidence that the accepted
+    native ATM lost its stops, so LiveRouter must quarantine/retry it rather than send
+    a market flatten.
+    """
+
+
 class AcceptedOrderError(ProtectionFailure):
     """A PLACE may be live, but its ownership/protection receipt is incomplete.
 
@@ -314,6 +324,59 @@ def _change_confirmation(
     return "confirmed", f"Modify command {command_id} replaced", observed_ids
 
 
+def _latest_modify_outcome(snapshot: dict[str, Any]) -> tuple[str, str]:
+    """Classify the newest visible Modify independently of requested geometry.
+
+    This is the restart/re-entry fence for a previously submitted CHANGE.  If the
+    broker exposes a Modify but not its final report, a later normalization pass must
+    wait for that command instead of issuing another mutation.
+    """
+    unavailable = {
+        str(value) for value in snapshot.get("_lifecycle_unavailable", [])
+    }
+    if "commands" in unavailable:
+        return "pending", "lifecycle commands unavailable"
+    commands = [
+        command
+        for command in _lifecycle_rows(snapshot, "_lifecycle_commands")
+        if str(command.get("commandType") or "").strip().lower() == "modify"
+        and _command_id(command)
+    ]
+    if not commands:
+        return "none", "no prior Modify command"
+    command = max(commands, key=_command_sort_key)
+    command_id = _command_id(command)
+    command_status = str(command.get("commandStatus") or "").strip().lower()
+    rejected_statuses = {
+        "riskrejected", "executionrejected", "executionstopped",
+    }
+    if command_status in rejected_statuses:
+        return "rejected", f"Modify command {command_id} ended {command_status}"
+    if "reports" in unavailable or f"reports:{command_id}" in unavailable:
+        return "pending", f"reports for Modify command {command_id} unavailable"
+    reports = [
+        report
+        for report in _lifecycle_rows(snapshot, "_lifecycle_reports")
+        if str(report.get("commandId") or "") == command_id
+    ]
+    if not reports:
+        return "pending", f"report for Modify command {command_id} not visible"
+    positive_report = False
+    for report in reports:
+        report_status = str(report.get("commandStatus") or "").strip().lower()
+        reject_reason = str(report.get("rejectReason") or "").strip().lower()
+        if report_status in rejected_statuses or reject_reason not in {"", "success"}:
+            detail = reject_reason or report_status or "rejected"
+            return "rejected", f"Modify command {command_id} rejected: {detail}"
+        report_order_status = str(report.get("ordStatus") or "").strip().lower()
+        if (report_status == "replaced" and reject_reason == "success"
+                and report_order_status in {"working", "suspended"}):
+            positive_report = True
+    if command_status == "replaced" and positive_report:
+        return "confirmed", f"Modify command {command_id} replaced"
+    return "pending", f"Modify command {command_id} has no final Replaced report"
+
+
 @dataclass
 class ExecutionReceipt:
     result: dict[str, Any]
@@ -331,6 +394,12 @@ class Executor:
     bracket_confirm_delay: float = 0.25
     change_retries: int = 3
     change_delay: float = 0.25
+    # A CHANGE that may have reached the broker is fenced until correlated lifecycle
+    # evidence resolves it.  This prevents a later reconciliation pass in the same
+    # process from resending the mutation while the first command is still pending.
+    _pending_changes: dict[tuple[str, str], tuple[dict[str, Any], set[str]]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def _symbol(self) -> str:
         return normalize_tradovate_symbol(self.execution_symbol)
@@ -702,7 +771,15 @@ class Executor:
         # CRITICAL RC2 call site: normalization is mandatory in the direct production path.
         try:
             finalized = await self.finalize_core(account, alloc, before_ids)
-        except (CrossTradeError, ProtectionFailure) as exc:
+        except NormalizationReadbackPending:
+            # The accepted native ATM remains broker-hosted and protective.  Read
+            # uncertainty is not authorization to flatten it.
+            raise
+        except CrossTradeError as exc:
+            raise NormalizationReadbackPending(
+                f"Core native ATM lifecycle readback pending: {exc}"
+            ) from exc
+        except ProtectionFailure as exc:
             await self._flatten_unverified_entry(
                 account, f"Core exact readback unavailable after accepted PLACE: {exc}"
             )
@@ -731,23 +808,54 @@ class Executor:
         Production CrossTradeClient always exposes ``order_lifecycle`` and therefore never
         uses this weaker path.
         """
+        key = (str(account), str(oid))
+        current = await self._read_order(account, oid)
+        if current is not None and _desired_matches(current, payload):
+            self._pending_changes.pop(key, None)
+            return current
+        already_pending = key in self._pending_changes
         last: Exception | None = None
-        for _ in range(max(1, self.change_retries)):
+        if not already_pending:
+            rate_attempts = 0
+            while True:
+                self._require_current(still_current)
+                self._pending_changes[key] = (dict(payload), set())
+                try:
+                    await self.client.change(account, oid, payload)
+                    break
+                except AmbiguousMutation as exc:
+                    # The command may be live.  Keep the fence and only read from here.
+                    last = exc
+                    break
+                except RateLimitExceeded as exc:
+                    # A documented mutation 429 is refused before broker execution.
+                    self._pending_changes.pop(key, None)
+                    rate_attempts += 1
+                    if rate_attempts >= max(1, self.change_retries):
+                        raise NormalizationReadbackPending(
+                            f"child {oid} CHANGE remained rate-limited: {exc}"
+                        ) from exc
+                    await asyncio.sleep(self.change_delay)
+                except CrossTradeError as exc:
+                    self._pending_changes.pop(key, None)
+                    raise NormalizationMutationUnconfirmed(
+                        f"definitive child {oid} CHANGE failure: {exc}"
+                    ) from exc
+
+        for poll in range(max(1, self.change_retries)):
             self._require_current(still_current)
-            try:
-                await self.client.change(account, oid, payload)
-            except (AmbiguousMutation, RateLimitExceeded) as exc:
-                last = exc
-            except CrossTradeError as exc:
-                raise ProtectionFailure(f"definitive child {oid} change failure: {exc}") from exc
             current = await self._read_order(account, oid)
             if current is not None and _desired_matches(current, payload):
+                self._pending_changes.pop(key, None)
                 return current
             last = last or ProtectionFailure(
                 f"child {oid} change acknowledged but exact readback differs"
             )
-            await asyncio.sleep(self.change_delay)
-        raise ProtectionFailure(f"could not normalize child {oid}: {last}")
+            if poll + 1 < max(1, self.change_retries):
+                await asyncio.sleep(self.change_delay)
+        raise NormalizationReadbackPending(
+            f"child {oid} CHANGE outcome unconfirmed; no resend: {last}"
+        )
 
     async def _change_exact(self, account: str, oid: str, payload: dict[str, Any], *,
                             baseline: dict[str, Any] | None = None,
@@ -761,17 +869,48 @@ class Executor:
             )
 
         self._require_current(still_current)
+        key = (str(account), str(oid))
         baseline = baseline or await self._read_order(account, oid)
         if baseline is None or "_lifecycle_commands" not in baseline:
-            raise ProtectionFailure(
+            raise NormalizationReadbackPending(
                 f"child {oid} lifecycle unavailable before CHANGE; mutation withheld"
             )
         baseline_unavailable = {
             str(value) for value in baseline.get("_lifecycle_unavailable", [])
         }
         if "commands" in baseline_unavailable:
-            raise ProtectionFailure(
+            raise NormalizationReadbackPending(
                 f"child {oid} lifecycle commands unavailable before CHANGE; mutation withheld"
+            )
+
+        pending_intent = self._pending_changes.get(key)
+        if pending_intent is not None:
+            pending_payload, pending_baseline_ids = pending_intent
+            outcome, detail, _observed = _change_confirmation(
+                baseline, pending_baseline_ids, pending_payload
+            )
+            if outcome == "rejected":
+                self._pending_changes.pop(key, None)
+                raise NormalizationMutationUnconfirmed(
+                    f"child {oid} CHANGE rejected: {detail}"
+                )
+            if outcome != "confirmed":
+                raise NormalizationReadbackPending(
+                    f"child {oid} prior CHANGE outcome pending; no resend: {detail}"
+                )
+            self._pending_changes.pop(key, None)
+
+        # Also fence a pending Modify discovered after process re-entry.  The lifecycle
+        # command itself is durable broker evidence even when this Executor did not submit
+        # it during the current process lifetime.
+        prior_outcome, prior_detail = _latest_modify_outcome(baseline)
+        if prior_outcome == "pending":
+            raise NormalizationReadbackPending(
+                f"child {oid} prior CHANGE outcome pending; no resend: {prior_detail}"
+            )
+        if prior_outcome == "rejected":
+            raise NormalizationMutationUnconfirmed(
+                f"child {oid} prior CHANGE rejected: {prior_detail}"
             )
         baseline_modify_ids = _modify_command_ids(baseline)
         if _desired_matches(baseline, payload):
@@ -784,6 +923,7 @@ class Executor:
         while True:
             self._require_current(still_current)
             ambiguous: Exception | None = None
+            self._pending_changes[key] = (dict(payload), set(baseline_modify_ids))
             try:
                 await self.client.change(account, oid, payload)
             except AmbiguousMutation as exc:
@@ -793,14 +933,16 @@ class Executor:
             except RateLimitExceeded as exc:
                 # CrossTrade documents an explicit HTTP 429 as refused before execution.
                 # It is the sole mutation failure that is safe to resend after cooldown.
+                self._pending_changes.pop(key, None)
                 rate_attempts += 1
                 if rate_attempts >= max(1, self.change_retries):
-                    raise ProtectionFailure(
+                    raise NormalizationReadbackPending(
                         f"child {oid} CHANGE remained rate-limited: {exc}"
                     ) from exc
                 await asyncio.sleep(self.change_delay)
                 continue
             except CrossTradeError as exc:
+                self._pending_changes.pop(key, None)
                 raise NormalizationMutationUnconfirmed(
                     f"definitive child {oid} CHANGE failure: {exc}"
                 ) from exc
@@ -815,8 +957,10 @@ class Executor:
                     )
                     last_detail = detail
                     if outcome == "confirmed":
+                        self._pending_changes.pop(key, None)
                         return current
                     if outcome == "rejected":
+                        self._pending_changes.pop(key, None)
                         raise NormalizationMutationUnconfirmed(
                             f"child {oid} CHANGE rejected: {detail}"
                         )
@@ -828,7 +972,7 @@ class Executor:
             # Geometry may already match a rejected OrderVersion. Without a final new
             # Modify command/report, retrying could race an in-flight broker command.
             suffix = f"; transport result was ambiguous: {ambiguous}" if ambiguous else ""
-            raise NormalizationMutationUnconfirmed(
+            raise NormalizationReadbackPending(
                 f"child {oid} CHANGE outcome unconfirmed; no resend: {last_detail}{suffix}"
             )
 
@@ -839,12 +983,20 @@ class Executor:
 
         Ownership comes from broker-returned child IDs when available, otherwise from the
         before/after working-order ID delta. Price/quantity similarity alone never grants
-        mutation authority. Any ambiguity fails toward less exposure by flattening.
+        mutation authority. Read ambiguity is surfaced as pending so the accepted native
+        ATM can remain protective while LiveRouter quarantines and retries it.
         """
+        incomplete_exact_readback = False
         for _ in range(self.bracket_confirm_retries):
             self._require_current(still_current)
             orders, owned_ids = await self._discover_owned_children(account, before_ids, response_ids)
             owned_rows = _owned(orders, owned_ids)
+            if (owned_ids and (len(owned_rows) < len(owned_ids)
+                               or any(not _has_exact_geometry(o) for o in owned_rows))):
+                # Raw working-order identity proves native children still exist, but
+                # lifecycle/OrderVersion did not expose exact geometry.  That is read
+                # uncertainty, never affirmative missing protection.
+                incomplete_exact_readback = True
             targets, stops = classify_children(owned_rows)
             expected_targets = 1 + (1 if alloc.runner_qty else 0)
             if len(targets) == expected_targets and len(stops) == expected_targets:
@@ -889,6 +1041,10 @@ class Executor:
                     [_order_id(o) for o in verified_stops if _order_id(o)],
                 )
             await asyncio.sleep(self.bracket_confirm_delay)
+        if incomplete_exact_readback:
+            raise NormalizationReadbackPending(
+                "Core native ATM children are live but exact lifecycle readback is pending"
+            )
         raise ProtectionFailure("Core owned bracket normalization/readback failed")
 
 

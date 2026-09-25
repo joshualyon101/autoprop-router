@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     CROSSTRADE_TOKEN: str = ''
     AUTOPROP_WEBHOOK_TOKEN: str = ''
     SQLITE_PATH: str = '/data/autoprop_router_v123.sqlite3'
+    # Shadow observations are kept separate from any prior live-router state.  A
+    # shadow deployment must never claim or reconcile durable live mutation rows.
+    SHADOW_SQLITE_PATH: str = '/data/autoprop_router_shadow.sqlite3'
+    # Broker reads are opt-in in shadow mode.  Keeping them off prevents the observer
+    # from competing with the direct CrossTrade route for snapshot/lifecycle capacity.
+    SHADOW_BROKER_READS_ENABLED: bool = False
     ACCOUNT_CONFIG_PATH: str = '/data/accounts.json'
     ACCOUNT_CONFIG_JSON: str = ''
     RISK_STATE_JSON: str = ''
@@ -44,7 +50,10 @@ class Settings(BaseSettings):
     CONSISTENCY_MIN_PROFIT_ROOM: float = 50.0
     USE_CROSSTRADE_POSITION_GATE: bool = True
     USE_CROSSTRADE_MAX_POSITIONS_GATE: bool = False
-    AUTOPROP_EXECUTION_MODE: str = 'live'
+    # Supported values are ``live`` and ``shadow``.  Shadow is deliberately the
+    # release default; live mutations require an explicit deployment override plus
+    # the existing independent arm gates.
+    AUTOPROP_EXECUTION_MODE: str = 'shadow'
     AUTOPROP_MANAGEMENT_MODE: str = 'exact_formula_parity'
     LIVE_MAX_QTY_PER_ACCOUNT: int = 0
     NATIVE_ATM_BREAKEVEN_AFTER_TP1: bool = False
