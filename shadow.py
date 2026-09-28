@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from collections.abc import Callable, Iterable
@@ -39,6 +40,43 @@ def _fallback_action(kind: str) -> str:
     return f"WOULD_OBSERVE_{token or 'UNKNOWN'}"
 
 
+def _org_regime_sizing(event: ParsedEvent) -> dict[str, Any] | None:
+    """Audit Pine's source quantity only; never derive an account order quantity."""
+    fields = event.fields or {}
+    if event.kind != "ENTRY" or event.engine != "ORG" or fields.get("RG_VER") != "EW5_B50":
+        return None
+    result: dict[str, Any] = {
+        "rule": "EW5_B50",
+        "enabled": fields.get("RG_EN") == "1",
+        "flagged": fields.get("RG_HALF") == "1",
+        "source_qty": event.plan.source_qty if event.plan else None,
+        "base_qty": None,
+        "breadth_5_pp": None,
+        "expected_source_qty": None,
+        "verification": "UNVERIFIABLE",
+    }
+    try:
+        if fields.get("RG_EN") not in {"0", "1"} or fields.get("RG_HALF") not in {"0", "1"}:
+            return result
+        base_qty = int(fields["Q_BASE"])
+        if base_qty < 1 or result["source_qty"] is None:
+            return result
+        result["base_qty"] = base_qty
+        breadth = float(fields.get("B5", "nan"))
+        if math.isfinite(breadth):
+            result["breadth_5_pp"] = breadth
+        expected_flag = bool(result["enabled"] and math.isfinite(breadth) and breadth > 0.50)
+        expected_qty = max(1, base_qty // 2) if expected_flag else base_qty
+        result["expected_source_qty"] = expected_qty
+        result["verification"] = (
+            "MATCH" if result["flagged"] == expected_flag and result["source_qty"] == expected_qty
+            else "MISMATCH"
+        )
+    except (ValueError, TypeError, KeyError):
+        pass
+    return result
+
+
 class ShadowObserver:
     """Record what an alert means without touching any broker or live ownership state.
 
@@ -74,6 +112,7 @@ class ShadowObserver:
         receipt_epoch: float,
         observed_at_epoch: float,
         intended_account_ids: list[str],
+        regime_sizing: dict[str, Any] | None,
     ) -> dict[str, Any]:
         # Both workers can observe alerts concurrently.  Serialize the tiny runtime-state
         # read/modify/write so counters are not lost.  No live attempt/trade/circuit method
@@ -95,6 +134,8 @@ class ShadowObserver:
             }
             if event.plan is not None:
                 last_event["plan_event_id"] = event.plan.event_id
+            if regime_sizing is not None:
+                last_event["regime_sizing"] = regime_sizing
             summary = {
                 "mode": "shadow",
                 "total_events": total,
@@ -122,6 +163,7 @@ class ShadowObserver:
             or (event.plan.event_id if event.plan is not None else "")
         )
         action = _ACTION_BY_KIND.get(event.kind, _fallback_action(event.kind))
+        regime_sizing = _org_regime_sizing(event)
 
         accounts = self._accounts()
         intended = [
@@ -157,6 +199,8 @@ class ShadowObserver:
             result["pulse"] = pulse
         if event.fields:
             result["fields"] = dict(event.fields)
+        if regime_sizing is not None:
+            result["regime_sizing"] = regime_sizing
 
         summary = await self._record_summary(
             event=event,
@@ -165,6 +209,7 @@ class ShadowObserver:
             receipt_epoch=receipt,
             observed_at_epoch=observed_at,
             intended_account_ids=intended_ids,
+            regime_sizing=regime_sizing,
         )
         result["shadow_total_events"] = summary["total_events"]
         return result
