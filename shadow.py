@@ -53,6 +53,10 @@ def _org_regime_sizing(event: ParsedEvent) -> dict[str, Any] | None:
         "base_qty": None,
         "breadth_5_pp": None,
         "expected_source_qty": None,
+        "policy": fields.get("RG_POLICY", "OPTIONAL"),
+        "data_status": "UNKNOWN",
+        "quantity_verification": "UNVERIFIABLE",
+        "condition_verification": "UNVERIFIABLE",
         "verification": "UNVERIFIABLE",
     }
     try:
@@ -62,15 +66,51 @@ def _org_regime_sizing(event: ParsedEvent) -> dict[str, Any] | None:
         if base_qty < 1 or result["source_qty"] is None:
             return result
         result["base_qty"] = base_qty
-        breadth = float(fields.get("B5", "nan"))
-        if math.isfinite(breadth):
-            result["breadth_5_pp"] = breadth
-        expected_flag = bool(result["enabled"] and math.isfinite(breadth) and breadth > 0.50)
-        expected_qty = max(1, base_qty // 2) if expected_flag else base_qty
+        # Check arithmetic against the reported decision independently of the
+        # serialized market reading. This is not per-account destination sizing.
+        expected_qty = max(1, base_qty // 2) if result["flagged"] else base_qty
         result["expected_source_qty"] = expected_qty
-        result["verification"] = (
-            "MATCH" if result["flagged"] == expected_flag and result["source_qty"] == expected_qty
+        result["quantity_verification"] = (
+            "MATCH" if result["source_qty"] == expected_qty
             else "MISMATCH"
+        )
+        policy_valid = result["policy"] in {"OPTIONAL", "ALWAYS_ON"}
+        policy_mismatch = result["policy"] == "ALWAYS_ON" and not result["enabled"]
+        if policy_mismatch or (not result["enabled"] and result["flagged"]):
+            result["condition_verification"] = "MISMATCH"
+            result["reason"] = "INCONSISTENT_POLICY_OR_FLAGS"
+        elif not policy_valid:
+            result["reason"] = "UNKNOWN_POLICY"
+        elif "B5" not in fields:
+            result["reason"] = "MISSING_BREADTH_FIELD"
+        else:
+            try:
+                breadth = float(fields["B5"])
+            except (ValueError, TypeError):
+                breadth = float("inf")
+            if math.isnan(breadth):
+                # Pine deliberately keeps normal size when the index series is
+                # unavailable. Quantity can be checked, but breadth cannot.
+                result["data_status"] = "UNAVAILABLE"
+                result["condition_verification"] = "MISMATCH" if result["flagged"] else "UNVERIFIABLE"
+                result["reason"] = "INDEX_DATA_UNAVAILABLE"
+            elif not math.isfinite(breadth):
+                result["data_status"] = "INVALID"
+                result["reason"] = "INVALID_BREADTH_FIELD"
+            else:
+                result["data_status"] = "AVAILABLE"
+                result["breadth_5_pp"] = breadth
+                # Pine transmits B5 to eight decimal places. Around +0.50 the
+                # original strict comparison cannot always be reconstructed.
+                if result["enabled"] and math.isclose(breadth, 0.50, rel_tol=0.0, abs_tol=5.001e-9):
+                    result["reason"] = "BREADTH_ROUNDING_BOUNDARY"
+                else:
+                    expected_flag = bool(result["enabled"] and breadth > 0.50)
+                    result["condition_verification"] = "MATCH" if result["flagged"] == expected_flag else "MISMATCH"
+        checks = {result["quantity_verification"], result["condition_verification"]}
+        result["verification"] = (
+            "MISMATCH" if "MISMATCH" in checks else
+            "UNVERIFIABLE" if "UNVERIFIABLE" in checks else "MATCH"
         )
     except (ValueError, TypeError, KeyError):
         pass

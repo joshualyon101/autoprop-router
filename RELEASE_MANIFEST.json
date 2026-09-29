@@ -1,0 +1,26 @@
+{
+  "pine": {
+    "filename": "AutoProp_Fusion_Trade_Navigator_v1.2.5_FINAL.pine",
+    "version": "1.2.5",
+    "sha256": "dd1c29a7b93f6a45cdc4087a29c6f5052b6db3dc7b807551e1e2e429a7e27ac3",
+    "org_breadth_rule": "EW5_B50",
+    "policy": "ALWAYS_ON",
+    "threshold_pp": 0.5,
+    "comparison": ">",
+    "allocation": "floor(final executable ORG quantity / 2), minimum 1 when base > 0"
+  },
+  "router": {
+    "version": "1.2.8.12-shadow-observer-org-breadth",
+    "default_role": "shadow",
+    "live_alert_gate": false,
+    "shadow_broker_reads": false
+  },
+  "validation": {
+    "shadow_tests_passed": 54,
+    "live_role_regression_tests_passed": 315,
+    "python_syntax_files_passed": 50,
+    "pine_trading_logic_matches_backtested_RC4_On": true,
+    "final_pine_compiled_in_TradingView": false,
+    "deployed_by_this_task": false
+  }
+}

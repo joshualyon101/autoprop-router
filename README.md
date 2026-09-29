@@ -1,118 +1,30 @@
-# AutoProp Router v1.2.3 — Exact Parity Production RC2
+# AutoProp Router v1.2.8.12 — Shadow Observer
 
-Production-wired release candidate for AutoProp ICT Fusion v1.1.5 DUAL ROUTE RC3 in **Railway Router** mode.
+Companion to **AutoProp Fusion - Trade Navigator v1.2.5**.
 
-## Safety state
+The Pine strategy permanently applies the ORG breadth rule to Challenge, Funded, and Personal accounts of every size. This Router records the plan and checks its reported ORG sizing. Production execution remains TradingView directly to CrossTrade.
 
-The service is designed to be deployed in a fully staged/disarmed state first:
+## ORG sizing rule
 
-```text
-TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false
-```
+Use the last completed five-session percentage return of NASDAQ:NDXE minus NASDAQ:NDX. When the difference is **strictly greater than +0.50 percentage points**, halve ORG's executable contract count after the existing quantity limits and consistency calculation. Round down, with a minimum of one for an otherwise valid entry. A zero quantity remains zero. For example: 8 becomes 4, 7 becomes 3, and 1 remains 1.
 
-With that gate false, webhook payloads are parsed but broker mutation is blocked. Health, account discovery, storage, cash/MLL/ledger state, and dry-run endpoints remain available.
+The rule applies to primary entries, fresh-FVG re-entries, deferred entries, and reclaim entries. Deferred entries retain the breadth condition from setup qualification and apply it once to the freshly recalculated executable quantity. Missing index values retain normal size. The Pine status table's ORG TODAY row reports the current condition. This release has no account-size split and no setting to turn the rule off.
 
-Only set the final gate true after `/admin/live-readiness/<token>` reports no problems for every enabled account and the new TradingView alert has been rebuilt from the parity-validated RC3 Pine.
+## Router compatibility
 
-## Production guarantees implemented
+The previous v1.2.8.11 shadow Router already accepts the final Pine alert format. Updating is recommended for the improved audit, matching release documentation, and new contract tests; it is not required to halve orders. Pine performs the reduction. The Router does not halve the quantity again.
 
-- Pine owns all five-engine setup qualification and portfolio arbitration.
-- Router independently sizes every destination account from exact Challenge/Funded/Personal formulas.
-- Pine-equivalent nearest-contract rounding, including `.5` ties upward.
-- Personal Aggressive `1.20x`; Funded pre-lock Aggressive `1.10x`.
-- ORG-only modeled round-trip execution cost in sizing.
-- Destination-specific Core TP1/runner split and consistency target clipping.
-- Funded Core 12R minimum-loss-buffer safety.
-- Closed cash required; net liquidation is not substituted.
-- Prop MLL/failure floor must be separately verified.
-- New York calendar-day realized P&L from durable fills.
-- ORG re-entry requires destination-specific prior stop proof.
-- Broker position/order gates and per-account event dedupe.
-- Single-target absolute bracket readback.
-- Core native multi-tier protection followed by exact absolute-price child normalization/readback.
-- Core 75%-before-50% pre-TP1 management, destination TP1 detection, runner BE +1 tick, completed-5m swing trail.
-- Silver +3R / +0.5R stop-lock from the destination's actual broker fill.
-- Actual destination entry fill is mandatory for live management; unprovable accepted fills are flattened.
-- Ambiguous PLACE is reconciled by stable custom ID and never blindly resent.
-- Stop changes are monotonic and owned-child only.
-- Global and engine-scoped hard-flat handling.
-- Linked CrossTrade accounts are discovered/read back; unknown linked accounts remain unconfigured and cannot receive trades.
-- Versioned SQLite path avoids collision with legacy Router database schemas.
-- Dedupe retention prevents unbounded growth of the new SQLite database.
+The final alert includes `RG_VER=EW5_B50`, `RG_POLICY=ALWAYS_ON`, `RG_EN=1`, `B5`, `RG_HALF`, and `Q_BASE` alongside `QTY`. Direct CrossTrade alerts continue to carry the executable quantity in `qty` without these observer fields. Older Pine alerts, including messages without any breadth fields and RC4 with its optional rule disabled, remain accepted by shadow mode.
 
-## Validation
+For new ORG messages, the shadow inbox and last-event summary contain `regime_sizing`:
 
-See `PRODUCTION_VALIDATION_REPORT.md`.
+- `quantity_verification`: whether source QTY matches the supplied base and half flag.
+- `condition_verification`: whether the supplied breadth, enabled flag, and policy are consistent.
+- `verification`: combined MATCH, MISMATCH, or UNVERIFIABLE.
+- `data_status` and, when needed, `reason`: explain missing/invalid readings or a rounded threshold boundary.
 
-Current offline release validation:
+The source reports B5 to eight decimal places. If it rounds to the +0.50 boundary, the audit cannot reconstruct the exact comparison and reports UNVERIFIABLE instead of a false mismatch. Missing market data also prevents full verification, even when quantity arithmetic matches. These results never place, change, or cancel orders. They audit source fields, not an independent market feed or broker fill.
 
-```text
-python -m compileall -q .       PASS
-pytest -q                        150 passed
-FastAPI/settings startup         PASS
-Independent Golden Oracle        35 passed
-```
+## Install and review
 
-## Railway staging endpoints
-
-```text
-GET /health
-GET /admin/accounts/<WEBHOOK_TOKEN>
-GET /admin/discovery/<WEBHOOK_TOKEN>
-GET /admin/live-readiness/<WEBHOOK_TOKEN>
-GET /admin/dry-run/<WEBHOOK_TOKEN>
-GET /admin/storage/<WEBHOOK_TOKEN>
-POST /admin/risk-state/<WEBHOOK_TOKEN>
-POST /webhook/tradingview/<WEBHOOK_TOKEN>
-```
-
-## Required Railway variables
-
-Use `.env.example` as the canonical list. Secrets and live account registry/risk state belong in Railway variables, not GitHub.
-
-For migration safety the default database is:
-
-```text
-SQLITE_PATH=/data/autoprop_router_v123.sqlite3
-```
-
-Do not point this RC at the legacy `/data/autoprop_router.sqlite3` unless a separate migration has been performed.
-
-## Account state
-
-`ACCOUNT_CONFIG_JSON` is the authoritative rule registry when supplied. Each enabled account must have `rules_verified=true`.
-
-`RISK_STATE_JSON` or `POST /admin/risk-state/<token>` supplies facts CrossTrade cannot infer from a normal Tradovate account snapshot, including current prop MLL/failure floor and funded-lock state. For prop accounts, unverified MLL or unverified durable-ledger coverage fails closed.
-
-## TradingView alert
-
-Pine: `AutoProp_ICT_Fusion_v1.1.5_DUAL_ROUTE_RC3_ROUTER_CONTRACT_FIX.pine`
-
-Strategy input:
-
-```text
-Execution Alert Route = Railway Router
-```
-
-TradingView alert:
-
-```text
-Condition: AutoProp Fusion — Order fills and alert() function calls
-Message: {{strategy.order.alert_message}}
-Webhook: https://autoprop-router-production.up.railway.app/webhook/tradingview/<WEBHOOK_TOKEN>
-```
-
-Do not wrap the message in extra JSON. Recreate the alert after any Pine version or route change.
-
-## First-live acceptance
-
-The first broker-mutating trade remains an acceptance test. It should be watched while awake. Confirm exact participating accounts, quantities, targets, Core split, protective orders, no duplicates, and management transitions before treating the system as unattended production.
-
-
-## Legacy state recovery
-
-For migration from the previously deployed Router, this RC adds a read-only inspector:
-
-GET /admin/legacy-inspect/<WEBHOOK_TOKEN>
-
-It opens /data/autoprop_router.sqlite3 in SQLite read-only mode, lists non-system tables and up to 200 rows per table, and redacts columns whose names look like secrets/tokens/passwords. It does not mutate the legacy database. Use it only while TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false, then migrate the verified account/risk state into ACCOUNT_CONFIG_JSON / RISK_STATE_JSON.
+Read `DEPLOY_SHADOW.md` for the deployment settings and alert setup. Read `RELEASE_AUDIT.md` for tests, fixes, and remaining validation limits. The package includes no credentials or account state.
