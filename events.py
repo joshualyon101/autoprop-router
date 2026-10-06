@@ -128,10 +128,29 @@ def parse_alert(raw: str) -> ParsedEvent:
         target = _f(d, "TP")
         if None in (entry, stop, target) or not side:
             raise ValueError(f"{engine} ENTRY missing exact geometry")
+        org_regime_fields: dict[str, str] = {}
+        if engine == "ORG" and any(
+            key.startswith("RG_") or key == "Q_BASE" for key in d
+        ):
+            relevant = {"QTY", "Q", "Q_BASE", "B5"}
+            org_regime_fields = {
+                key: value for key, value in d.items()
+                if key.startswith("RG_") or key in relevant
+            }
+            seen: set[str] = set()
+            for part in parts[4:] if side else parts[3:]:
+                if "=" not in part:
+                    continue
+                key = part.split("=", 1)[0]
+                if key.startswith("RG_") or key in relevant:
+                    if key in seen:
+                        org_regime_fields["__DUPLICATE_FIELD__"] = key
+                    seen.add(key)
         plan = CanonicalPlan(event_id=stable_event_id(raw), engine=engine, side=side,
                              entry=entry, stop=stop, tp1=target,
                              reentry=d.get("REENTRY") == "1",
-                             reentry_type=d.get("TYPE", ""), source_qty=_i(d, "QTY", "Q"))
+                             reentry_type=d.get("TYPE", ""), source_qty=_i(d, "QTY", "Q"),
+                             org_regime_fields=org_regime_fields)
         return ParsedEvent(kind="ENTRY", plan=plan, engine=engine, side=side, fields=d, raw=raw)
 
     if engine == "SILVER" and action in {"MOVE_STOP", "STOP_MOVE"}:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from allocation import AllocationBlocked
+from allocation import AllocationBlocked, org_regime_quantity, validate_org_regime
 from crosstrade import CrossTradeError, RateLimitExceeded
 from models import AccountRule, Allocation, CanonicalPlan
 from parity import (
@@ -102,6 +102,7 @@ def _fallback_budget(plan: CanonicalPlan, rule: AccountRule, settings) -> tuple[
 def allocate_state_fallback(plan: CanonicalPlan, rule: AccountRule, settings,
                             *, reason: str) -> Allocation:
     """Allocate without state while keeping actual initial risk at/below the fallback cap."""
+    org_half = validate_org_regime(plan)
     if not bool(getattr(settings, "STATE_FALLBACK_ENABLED", True)):
         raise AllocationBlocked("state fallback disabled")
     if not rule.enabled:
@@ -123,6 +124,7 @@ def allocate_state_fallback(plan: CanonicalPlan, rule: AccountRule, settings,
         raise AllocationBlocked(
             f"state fallback budget ${budget:.2f} is below one-contract risk ${rpc:.2f}"
         )
+    qty = org_regime_quantity(qty, org_half)
 
     if plan.engine == "CORE":
         tp2 = plan.tp2 if plan.tp2 is not None else plan.tp1

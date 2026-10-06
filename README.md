@@ -1,4 +1,19 @@
-# AutoProp Router v1.2.8.15 — Guarded Readback Recovery RC1
+# AutoProp Router v1.2.8.16 — Live ORG Breadth RC1
+
+This release applies the Pine source's frozen, always-on ORG breadth half-size decision
+to each live destination's executable quantity after its existing account sizing,
+contract cap, and consistency checks. Bounded state fallback applies it after its
+conservative quantity floor. It also fixes an entry preparation exception when a disabled destination is present
+and preserves the guarded readback recovery from v15.
+
+Use AutoProp Fusion v1.2.6 ALERT RUNTIME SAFETY RC1 for the matching Pine metadata.
+Legacy ORG alerts without regime markers remain compatible and keep their previous
+quantity behavior. Explicit malformed or unsupported regime metadata blocks allocation
+before an entry can be placed. No new environment variables or reset are required.
+
+See `LIVE_ORG_BREADTH_V1_2_8_16.md` for the contract, installation, and validation.
+
+## Retained v1.2.8.15 recovery behavior
 
 This release adds automatic recovery for a resolved accepted-entry transport-read timeout,
 after repeated live flat/clear broker observations and fresh verified account data. It

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
+import re
 
 from models import AccountRule, AccountState, Allocation, CanonicalPlan
 from parity import (
@@ -15,6 +17,54 @@ from parity import (
 
 class AllocationBlocked(RuntimeError):
     pass
+
+
+def validate_org_regime(plan: CanonicalPlan) -> bool:
+    """Validate the configured Pine source's frozen ORG decision; return its half flag.
+
+    Legacy alerts without metadata keep their existing sizing. This validates reported
+    observations, not an independently fetched index feed. Pine emits B5 at eight decimal
+    places, so a transmitted boundary reading cannot reconstruct the strict comparison;
+    preserve the reported decision there after checking source-quantity arithmetic.
+    Shadow parsing deliberately retains malformed metadata for observation.
+    """
+    fields = plan.org_regime_fields
+    if plan.engine != "ORG" or not fields:
+        return False
+    required = {"RG_VER", "RG_POLICY", "RG_EN", "RG_HALF", "Q_BASE", "B5", "QTY"}
+    if set(fields) != required:
+        raise AllocationBlocked("ORG regime metadata incomplete, duplicated, or unknown")
+    if (fields["RG_VER"] != "EW5_B50" or fields["RG_POLICY"] != "ALWAYS_ON"
+            or fields["RG_EN"] != "1" or fields["RG_HALF"] not in {"0", "1"}):
+        raise AllocationBlocked("ORG regime contract/policy/flags invalid")
+    if any(re.fullmatch(r"[0-9]+", fields[key]) is None for key in {"Q_BASE", "QTY"}):
+        raise AllocationBlocked("ORG regime source quantities must be positive integers")
+    base_qty, source_qty = int(fields["Q_BASE"]), int(fields["QTY"])
+    half = fields["RG_HALF"] == "1"
+    expected_qty = max(1, base_qty // 2) if half else base_qty
+    if (base_qty < 1 or source_qty < 1 or plan.source_qty != source_qty
+            or source_qty != expected_qty):
+        raise AllocationBlocked("ORG regime source-quantity mismatch")
+    reading = fields["B5"]
+    if reading in {"NaN", "na"}:
+        if half:
+            raise AllocationBlocked("ORG regime half flag requires available breadth data")
+        return False
+    try:
+        breadth = float(reading)
+    except (TypeError, ValueError) as exc:
+        raise AllocationBlocked("ORG regime breadth invalid") from exc
+    if not math.isfinite(breadth):
+        raise AllocationBlocked("ORG regime breadth invalid")
+    boundary = math.isclose(breadth, 0.50, rel_tol=0.0, abs_tol=5.001e-9)
+    if not boundary and half != (breadth > 0.50):
+        raise AllocationBlocked("ORG regime breadth/half mismatch")
+    return half
+
+
+def org_regime_quantity(qty: int, half: bool) -> int:
+    """Halve a valid destination quantity after its existing caps/consistency checks."""
+    return max(1, qty // 2) if half and qty > 0 else qty
 
 
 def personal_eod_risk_basis(rule: AccountRule, state: AccountState) -> float:
@@ -93,6 +143,7 @@ def _base_risk(rule: AccountRule, state: AccountState) -> tuple[float, float, fl
 
 def allocate(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
              *, max_state_age_seconds: float = 20.0, now: datetime | None = None) -> Allocation:
+    org_half = validate_org_regime(plan)
     if not rule.enabled:
         raise AllocationBlocked("account disabled")
     if not rule.rules_verified:
@@ -160,6 +211,7 @@ def allocate(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
                         ceiling_fraction=ceiling, base_target=consistency_base_target)
     if q < 1:
         raise AllocationBlocked("daily profit room <= $50")
+    q = org_regime_quantity(q, org_half)
     target = consistency_target(entry=plan.entry, natural_target=plan.tp1, qty=q,
                                 realized_today=state.realized_today,
                                 enabled=consistency_enabled, ceiling_fraction=ceiling,

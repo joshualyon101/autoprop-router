@@ -98,6 +98,9 @@ class CanonicalPlan(BaseModel):
     contract_risk_dollars: Optional[float] = None
     expiry_time_ms: Optional[int] = None
     contract_version: str = ""
+    # Preserve Pine's frozen ORG sizing decision through durable plan JSON.
+    # Shadow mode records malformed metadata; live allocators validate it before PLACE.
+    org_regime_fields: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_geometry(self):

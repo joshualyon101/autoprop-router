@@ -1368,7 +1368,7 @@ class LiveRouter:
         async def prepare(rule: AccountRule):
             if not rule.enabled:
                 return None, {'account_id': rule.account_id, 'status': 'SKIP',
-                              'reason': 'disabled'}, None
+                              'reason': 'disabled'}, None, None
             try:
                 if rule.account_id in unresolved_accounts:
                     raise AllocationBlocked('prior entry attempt is still unresolved')
