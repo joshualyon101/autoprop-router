@@ -26,6 +26,7 @@ from state_fallback import (
     is_transient_state_failure,
 )
 from store import Store
+from entry_recovery import recover_readback_circuit
 
 
 def _rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -84,6 +85,9 @@ class LiveRouter:
     def replace_accounts(self, accounts: list[AccountRule]) -> None:
         """Atomically publish a new immutable account-list snapshot for future work."""
         self.accounts = list(accounts)
+
+    async def recover_readback_circuit(self) -> dict:
+        return await recover_readback_circuit(self)
 
     def safety_work_pending(self) -> bool:
         """True while broker read capacity must be reserved for exposure management."""
@@ -2187,9 +2191,10 @@ class LiveRouter:
                 if age >= timeout:
                     # The broker-returned OSO stop remains the safety boundary. A read outage
                     # opens the circuit but does not itself justify a market flatten.
-                    self.store.trip_entry_circuit(
+                    self.store.trip_entry_circuit_for_attempt(
+                        current.attempt_key, ('ACCEPTED',),
                         reason=f'{current.account_id}: accepted entry readback timed out: {exc}',
-                        event_key=current.attempt_key, outcome='READBACK_UNCONFIRMED',
+                        outcome='READBACK_UNCONFIRMED',
                     )
                 results.append({'account_id': current.account_id,
                                 'status': 'READBACK_PENDING', 'reason': str(exc)})

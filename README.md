@@ -1,4 +1,12 @@
-# AutoProp Router v1.2.8.14 — Bounded State Fallback RC1
+# AutoProp Router v1.2.8.15 — Guarded Readback Recovery RC1
+
+This release adds automatic recovery for a resolved accepted-entry transport-read timeout,
+after repeated live flat/clear broker observations and fresh verified account data. It
+also adds broker transport timing diagnostics and prevents a stale readback worker from
+opening a circuit after EXIT already closed its attempt. See
+`READBACK_RECOVERY_V1_2_8_15.md` for recovery guards, validation, and rollout.
+
+The v1.2.8.14 bounded state fallback below is retained unchanged.
 
 This release prevents a known temporary account-state read failure from immediately
 disabling every new entry. It adds a durable, conservative fallback window while keeping

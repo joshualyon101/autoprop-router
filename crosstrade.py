@@ -4,11 +4,24 @@ import asyncio
 import inspect
 import time
 import re
+import json
+import logging
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+_transport_logger = logging.getLogger('autoprop.transport')
+
+
+def _diagnostic_endpoint(path: str) -> str:
+    """Keep endpoint type without leaking account names, order IDs, or query values."""
+    path = path.split('?', 1)[0]
+    path = re.sub(r'(/accounts/)(?!snapshot(?:/|$))[^/]+', r'\1{account}', path)
+    path = re.sub(r'(/orders/)[^/]+', r'\1{order}', path)
+    return re.sub(r'(/fills/order/)[^/]+', r'\1{order}', path)
 
 
 class CrossTradeError(RuntimeError):
@@ -250,6 +263,11 @@ class CrossTradeClient:
     get_retry_max_delay_seconds: float = 5.0
     _http: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _http_loop: Any = field(default=None, init=False, repr=False)
+    transport_diagnostics: dict[str, Any] = field(
+        default_factory=lambda: {'process_started_at_epoch': time.time(),
+                                'transport_failures': 0, 'rate_limit_responses': 0},
+        init=False, repr=False,
+    )
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
@@ -284,6 +302,8 @@ class CrossTradeClient:
         deadline_epoch = kwargs.pop("_deadline_epoch", None)
         admission_guard = kwargs.pop("_admission_guard", None)
         get_attempts = 0
+        request_started = time.monotonic()
+        request_id = uuid.uuid4().hex[:16]
         while True:
             # The all-account snapshot is the ENTRY preflight immediately before the
             # mutation wave. CrossTrade documents a 20-request burst allowance, so do
@@ -294,6 +314,7 @@ class CrossTradeClient:
                 if method_u != "GET" or path == "/v1/api/tv/accounts/snapshot"
                 else self.request_min_interval_seconds
             )
+            rate_started = time.monotonic()
             await _acquire_rate_slot(
                 self.rate_limit_per_minute, self.rate_limit_window_seconds,
                 path=path,
@@ -306,20 +327,42 @@ class CrossTradeClient:
                 reserve_tokens=(0.0 if method_u != "GET"
                                 or path == "/v1/api/tv/accounts/snapshot" else 9.0),
             )
+            rate_wait = time.monotonic() - rate_started
             # The final admission check deliberately occurs after rate waiting and directly
             # before the irreversible broker call.
             if deadline_epoch is not None and time.time() > float(deadline_epoch):
                 raise EntryAdmissionClosed(f"{method_u} {path} blocked: entry dispatch deadline expired")
             if admission_guard is not None and not _guard_open(admission_guard):
                 raise EntryAdmissionClosed(f"{method_u} {path} blocked by control fence")
+            semaphore_started = time.monotonic()
+            semaphore_wait = 0.0
+            http_started = None
             try:
                 client = self._http_client()
                 if method_u == "GET":
                     async with _get_semaphore(self.safe_get_max_concurrency):
+                        semaphore_wait = time.monotonic() - semaphore_started
+                        http_started = time.monotonic()
                         r = await client.request(method_u, url, headers=self._headers(), **kwargs)
                 else:
+                    http_started = time.monotonic()
                     r = await client.request(method_u, url, headers=self._headers(), **kwargs)
             except httpx.TransportError as e:
+                exhausted = (method_u != 'GET' or get_attempts >= max(0, int(self.get_retry_max_retries)))
+                diagnostic = {
+                    'request_id': request_id, 'method': method_u,
+                    'endpoint': _diagnostic_endpoint(path),
+                    'error_type': type(e).__name__, 'attempt': get_attempts + 1,
+                    'exhausted': exhausted, 'observed_at_epoch': time.time(),
+                    'configured_timeout_seconds': self.timeout,
+                    'rate_wait_seconds': round(rate_wait, 4),
+                    'semaphore_wait_seconds': round(semaphore_wait, 4),
+                    'http_elapsed_seconds': round(time.monotonic() - (http_started or semaphore_started), 4),
+                    'request_elapsed_seconds': round(time.monotonic() - request_started, 4),
+                }
+                self.transport_diagnostics['transport_failures'] += 1
+                self.transport_diagnostics['last_transport_failure'] = diagnostic
+                _transport_logger.warning('AutoProp broker transport failure %s', json.dumps(diagnostic))
                 detail = str(e).strip() or type(e).__name__
                 if method_u in {"POST", "PUT", "PATCH", "DELETE"}:
                     raise AmbiguousMutation(f"{method_u} {path} network error: {detail}") from e
@@ -334,6 +377,18 @@ class CrossTradeClient:
 
             if r.status_code == 429:
                 rejection, retry_after = _rate_limit_response(r)
+                diagnostic = {
+                    'request_id': request_id, 'method': method_u,
+                    'endpoint': _diagnostic_endpoint(path), 'status_code': 429,
+                    'rejection': rejection, 'retry_after_seconds': retry_after,
+                    'attempt': get_attempts + 1, 'observed_at_epoch': time.time(),
+                    'rate_wait_seconds': round(rate_wait, 4),
+                    'semaphore_wait_seconds': round(semaphore_wait, 4),
+                    'http_elapsed_seconds': round(time.monotonic() - (http_started or semaphore_started), 4),
+                }
+                self.transport_diagnostics['rate_limit_responses'] += 1
+                self.transport_diagnostics['last_rate_limit_response'] = diagnostic
+                _transport_logger.warning('AutoProp broker rate limit %s', json.dumps(diagnostic))
                 retry_after = retry_after if retry_after > 0 else self.rate_limit_fallback_seconds
                 cooldown = max(retry_after, _get_retry_delay(
                     self.get_retry_delay_seconds, self.get_retry_backoff_multiplier,
@@ -386,6 +441,15 @@ class CrossTradeClient:
                 raise CrossTradeError(
                     f"{method_u} {path} API rejected request: {detail}"
                 )
+            if get_attempts:
+                diagnostic = {
+                    'request_id': request_id, 'method': method_u,
+                    'endpoint': _diagnostic_endpoint(path), 'attempts': get_attempts + 1,
+                    'request_elapsed_seconds': round(time.monotonic() - request_started, 4),
+                    'observed_at_epoch': time.time(),
+                }
+                self.transport_diagnostics['last_retry_recovery'] = diagnostic
+                _transport_logger.warning('AutoProp broker read recovered after retry %s', json.dumps(diagnostic))
             return payload
 
     async def list_accounts(self) -> dict[str, Any]:

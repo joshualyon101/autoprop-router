@@ -290,6 +290,11 @@ async def _state_refresh_loop():
                 failed = [r for r in result.get('results', []) if r.get('status') == 'ERROR']
                 if failed:
                     logger.warning('Account-state cache refresh failures %s', failed)
+                recovery = getattr(rt, 'recover_readback_circuit', None)
+                if callable(recovery):
+                    recovered = await recovery()
+                    if recovered.get('status') == 'RECOVERED':
+                        logger.warning('AutoProp readback circuit automatically recovered %s', recovered)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -602,6 +607,14 @@ def health():
         'asw_pending_limits': len(store.all_asw_pending()),
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
+        'readback_auto_recovery_enabled': bool(getattr(
+            settings, 'READBACK_AUTO_RECOVERY_ENABLED', True
+        )) and _LIVE_MODE,
+        'readback_auto_recovery': store.get_runtime_state('readback_auto_recovery') or {},
+        'broker_transport_diagnostics': (
+            getattr(getattr(_runtime_instance, 'client', None), 'transport_diagnostics', {})
+            if _LIVE_MODE else {}
+        ),
         'state_fallback_active': bool(state_fallback.get('active')),
         'state_fallback_entry_waves_used': int(
             state_fallback.get('entry_waves_used') or 0

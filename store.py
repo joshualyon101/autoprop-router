@@ -9,6 +9,7 @@ from typing import Iterable
 
 from models import (ActiveTrade, VerifiedRiskState, AswPending, AccountState,
                     EntryAttempt, AccountRule)
+from entry_recovery import eligible_readback_circuit
 
 
 class Store:
@@ -724,6 +725,78 @@ class Store:
 
     def entry_circuit(self) -> dict:
         return self.get_runtime_state("entry_circuit") or {"open": False}
+
+    def recover_readback_circuit_if_unchanged(
+            self, expected: dict, account_ids: list[str], max_state_age: float,
+            prop_account_ids: list[str] | None = None) -> dict | None:
+        """Reset only the exact circuit proven clear; recheck ownership under a write lock."""
+        if not eligible_readback_circuit(expected) or not account_ids:
+            return None
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='entry_circuit'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if current != expected:
+                conn.rollback()
+                return None
+            attempt = conn.execute(
+                "SELECT state FROM entry_attempts WHERE attempt_key=?",
+                (str(expected['event_key']),),
+            ).fetchone()
+            busy = (attempt is None or str(attempt[0]) not in {'CLOSED', 'FLAT'}
+                    or conn.execute("SELECT 1 FROM entry_attempts WHERE state IN "
+                                    "('PREPARED','SUBMITTING','ACCEPTED','ACTIVE','FLATTENING') LIMIT 1").fetchone()
+                    or conn.execute("SELECT 1 FROM active_trades LIMIT 1").fetchone()
+                    or conn.execute("SELECT 1 FROM asw_pending LIMIT 1").fetchone()
+                    or conn.execute("SELECT 1 FROM webhook_inbox WHERE status IN ('PENDING','PROCESSING') "
+                                    "AND kind IN ('EXIT','HARD_FLAT','ASW_CANCEL_PENDING',"
+                                    "'ASW_TIME_FLAT','SILVER_STOP_MOVE') LIMIT 1").fetchone())
+            intent_row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='silver_stop_intent'"
+            ).fetchone()
+            if busy or (intent_row and json.loads(intent_row[0]).get('pending')):
+                conn.rollback()
+                return None
+            now = time.time()
+            for account_id in account_ids:
+                row = conn.execute(
+                    "SELECT payload FROM cached_account_state WHERE account_id=?", (account_id,)
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                state = AccountState.model_validate_json(row[0])
+                stamp = state.state_timestamp
+                # Naive cache timestamps follow the same UTC interpretation as live.py.
+                if stamp.tzinfo is None:
+                    from datetime import timezone
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                age = now - stamp.timestamp()
+                if (state.account_id != account_id or age < -1.0 or age > max_state_age
+                        or not state.daily_ledger_verified
+                        or (account_id in (prop_account_ids or [])
+                            and (not state.mll_verified or state.mll_floor is None))):
+                    conn.rollback()
+                    return None
+            reset = {'open': False, 'reason': '', 'event_key': '', 'outcome': '',
+                     'reset_at_epoch': now,
+                     'reset_reason': 'accepted-entry readback recovered; repeated flat/clear observations',
+                     'previous_circuit': expected}
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('entry_circuit',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(reset, default=str),),
+            )
+            conn.commit()
+            return reset
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def state_fallback_status(self) -> dict:
         return self.get_runtime_state("state_fallback_episode") or {

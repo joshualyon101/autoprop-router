@@ -1,1 +1,1 @@
-__version__ = "1.2.8.14-bounded-state-fallback-rc1"
+__version__ = "1.2.8.15-readback-auto-recovery-rc1"

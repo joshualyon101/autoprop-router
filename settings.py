@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     ENTRY_RECONCILE_BASE_DELAY_SECONDS: float = 0.75
     ENTRY_RECONCILE_MAX_DELAY_SECONDS: float = 5.0
     ENTRY_RECONCILE_LOOP_SECONDS: float = 0.50
+    # Only a resolved accepted-entry transport-read timeout can auto-recover. Two
+    # independent flat/clear observations are required; new risk remains blocked
+    # throughout verification. This never resets ambiguity/protection circuits.
+    READBACK_AUTO_RECOVERY_ENABLED: bool = True
+    READBACK_AUTO_RECOVERY_INTERVAL_SECONDS: float = 10.0
+    READBACK_AUTO_RECOVERY_CONFIRMATIONS: int = 2
     # Safety-critical management intent is serviced independently of the webhook inbox.
     # The short interval is a wake-up fallback; new intent also wakes the loop instantly.
     SILVER_MANAGEMENT_LOOP_SECONDS: float = 0.25
