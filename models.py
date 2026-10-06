@@ -141,6 +141,8 @@ class Allocation(BaseModel):
     effective_risk_budget: float
     risk_per_contract: float
     skip_reason: str = ""
+    state_fallback: bool = False
+    state_fallback_reason: str = ""
 
 
 class AswPending(BaseModel):

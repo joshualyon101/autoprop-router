@@ -24,6 +24,7 @@ from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 from management import SILVER_STOP_CONTRACT
 from onboarding import discover_and_onboard
 from shadow import ShadowObserver
+from state_fallback import is_transient_state_failure
 
 settings = Settings()
 _EXECUTION_MODE = str(settings.AUTOPROP_EXECUTION_MODE or '').strip().lower()
@@ -404,16 +405,28 @@ async def _start_worker():
         failed = [row for row in primed.get('results', []) if row.get('status') == 'ERROR']
         if failed:
             logger.warning('Startup account-state cache warm-up failures %s', failed)
-            store.trip_entry_circuit(
-                reason=f'startup account-state cache warm-up failed: {failed}',
-                outcome='STARTUP_STATE_CACHE_UNREADY',
-            )
+            transient = [row for row in failed if is_transient_state_failure(
+                str(row.get('reason') or '')
+            )]
+            hard = [row for row in failed if row not in transient]
+            if transient:
+                store.note_state_fallback_failure(transient)
+            if hard:
+                store.trip_entry_circuit(
+                    reason=f'startup account-state cache warm-up failed: {hard}',
+                    outcome='STARTUP_STATE_CACHE_UNREADY',
+                )
     except Exception as exc:
         logger.exception('Startup account-state cache warm-up failed')
-        store.trip_entry_circuit(
-            reason=f'startup account-state cache warm-up failed: {exc}',
-            outcome='STARTUP_STATE_CACHE_UNREADY',
-        )
+        if is_transient_state_failure(exc):
+            store.note_state_fallback_failure([{
+                'account_id': 'GLOBAL', 'reason': str(exc),
+            }])
+        else:
+            store.trip_entry_circuit(
+                reason=f'startup account-state cache warm-up failed: {exc}',
+                outcome='STARTUP_STATE_CACHE_UNREADY',
+            )
     _worker_task = asyncio.create_task(
         _webhook_worker(control=False), name='autoprop-webhook-worker'
     )
@@ -545,6 +558,7 @@ def health():
     shadow_summary = store.get_runtime_state('shadow_observer_summary') or {}
     shadow_last = shadow_summary.get('last_event') or {}
     shadow_ready = bool(base.get('shadow_observation_ready', base['configuration_ready']))
+    state_fallback = store.state_fallback_status()
     broker_armed = False if _SHADOW_MODE else (
         base['broker_mutation_armed'] and not circuit.get('open') and unresolved == 0
         and not silver_intent
@@ -588,6 +602,17 @@ def health():
         'asw_pending_limits': len(store.all_asw_pending()),
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
+        'state_fallback_active': bool(state_fallback.get('active')),
+        'state_fallback_entry_waves_used': int(
+            state_fallback.get('entry_waves_used') or 0
+        ),
+        'state_fallback_max_entry_waves': int(getattr(
+            settings, 'STATE_FALLBACK_MAX_ENTRY_WAVES', 5
+        )),
+        'state_fallback_max_duration_seconds': float(getattr(
+            settings, 'STATE_FALLBACK_MAX_DURATION_SECONDS', 3600.0
+        )),
+        'state_fallback_failing_accounts': state_fallback.get('failing_accounts') or [],
         'unresolved_entry_attempts': unresolved,
         'silver_management_pending': bool(silver_intent),
         'silver_management_stage': int(silver_intent.get('stage') or 0),
@@ -630,6 +655,7 @@ async def live_readiness(token: str):
         runtime_problem = f'live runtime initialization failed: {exc}'
     if rt is None:
         circuit = store.entry_circuit()
+        state_fallback = store.state_fallback_status()
         unresolved = store.unresolved_entry_attempt_count()
         problems = list(base['problems']) + [runtime_problem or 'live runtime unavailable']
         if unresolved:
@@ -650,6 +676,7 @@ async def live_readiness(token: str):
             'asw_pending_limits': len(store.all_asw_pending()),
             'entry_circuit_open': bool(circuit.get('open')),
             'entry_circuit_reason': str(circuit.get('reason') or ''),
+            'state_fallback': state_fallback,
             'unresolved_entry_attempts': unresolved,
             'silver_management_pending': bool(store.silver_stop_intent()),
             'silver_management_stage': int(
@@ -739,10 +766,21 @@ async def live_readiness(token: str):
     for state_row, account_problems in inspected:
         if state_row is not None:
             states.append(state_row)
-        state_problems.extend(account_problems)
+        for problem in account_problems:
+            if is_transient_state_failure(problem):
+                discovery_warnings.append(
+                    f'{problem} (bounded conservative state fallback remains available)'
+                )
+                store.note_state_fallback_failure([{
+                    'account_id': str(problem).split(':', 1)[0],
+                    'reason': str(problem),
+                }])
+            else:
+                state_problems.append(problem)
     if wave_marker is not None and wave_marker.is_set():
         raise HTTPException(409, 'entry wave started during readiness; retry after dispatch')
     circuit = store.entry_circuit()
+    state_fallback = store.state_fallback_status()
     circuit_problems = ([f"entry circuit open: {circuit.get('reason') or 'manual reset required'}"]
                         if circuit.get('open') else [])
     unresolved = store.unresolved_entry_attempt_count()
@@ -763,6 +801,7 @@ async def live_readiness(token: str):
         'asw_pending_limits': len(store.all_asw_pending()),
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
+        'state_fallback': state_fallback,
         'unresolved_entry_attempts': unresolved,
         'silver_management_pending': bool(store.silver_stop_intent()),
         'silver_management_stage': int(

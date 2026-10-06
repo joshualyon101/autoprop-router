@@ -21,6 +21,10 @@ from models import (AccountRule, AccountState, ActiveTrade, Allocation, AswPendi
 from org_reentry import prove_prior_org_stop
 from state import StateUnverified, ny_date
 from state_refresh import refresh_account_state, durable_fills
+from state_fallback import (
+    allocate_asw_state_fallback, allocate_state_fallback,
+    is_transient_state_failure,
+)
 from store import Store
 
 
@@ -271,9 +275,32 @@ class LiveRouter:
                     })
                     break
                 results.append(await refresh(rule))
+        transient_failures = [
+            row for row in results
+            if row.get('status') == 'ERROR'
+            and is_transient_state_failure(str(row.get('reason') or ''))
+        ]
+        enabled_accounts = [rule for rule in self.accounts if rule.enabled]
+        fresh_accounts = {
+            str(row.get('account_id')) for row in results if row.get('status') == 'FRESH'
+        }
+        if transient_failures:
+            note_fallback = getattr(self.store, 'note_state_fallback_failure', None)
+            if callable(note_fallback):
+                note_fallback(transient_failures)
+        elif enabled_accounts and all(
+                rule.account_id in fresh_accounts for rule in enabled_accounts):
+            # FRESH_CACHED is intentionally insufficient: only a complete successful live
+            # refresh ends the outage window and auto-clears a state-owned circuit.
+            recover_fallback = getattr(self.store, 'recover_state_fallback', None)
+            if callable(recover_fallback):
+                recover_fallback()
+        fallback_status = getattr(self.store, 'state_fallback_status', None)
         return {'paused_for_safety': any(
                     row.get('status') == 'PAUSED_FOR_SAFETY' for row in results
-                ), 'results': results}
+                ), 'results': results,
+                'state_fallback': (fallback_status() if callable(fallback_status)
+                                   else {'active': False, 'entry_waves_used': 0})}
 
     async def org_history(self, rule: AccountRule) -> list[dict]:
         now = datetime.now(timezone.utc)
@@ -728,17 +755,114 @@ class LiveRouter:
                     and not self.store.unresolved_entry_attempt_count()
                     and not self.store.entry_aborted_after('ASW', admission_epoch))
 
+        # Resolve every account's state/allocation before the first irreversible LIMIT
+        # mutation. This makes the five-wave fallback decision fleet-wide and prevents an
+        # exhausted episode from being discovered after earlier destinations were placed.
+        asw_allocations: dict[str, Allocation] = {}
+        asw_pre_results: dict[str, dict[str, Any]] = {}
+        fallback_failures: list[dict[str, str]] = []
+        for rule in self.accounts:
+            if not rule.enabled:
+                continue
+            fallback_reason = ''
+            try:
+                try:
+                    state = await self.state_for(rule)
+                except (StateUnverified, CrossTradeError) as exc:
+                    if not is_transient_state_failure(exc):
+                        raise
+                    fallback_reason = str(exc)
+                    alloc = allocate_asw_state_fallback(
+                        event.plan, rule, self.settings, reason=fallback_reason
+                    )
+                else:
+                    try:
+                        alloc = allocate_asw(
+                            event.plan, rule, state,
+                            max_state_age_seconds=self.settings.MAX_STATE_AGE_SECONDS,
+                            now=now,
+                        )
+                    except AllocationBlocked as exc:
+                        if not is_transient_state_failure(exc):
+                            raise
+                        fallback_reason = str(exc)
+                        alloc = allocate_asw_state_fallback(
+                            event.plan, rule, self.settings, reason=fallback_reason
+                        )
+                asw_allocations[rule.account_id] = alloc
+                if fallback_reason:
+                    fallback_failures.append({
+                        'account_id': rule.account_id, 'reason': fallback_reason,
+                    })
+            except AllocationBlocked as exc:
+                asw_pre_results[rule.account_id] = {
+                    'account_id': rule.account_id, 'status': 'SKIP',
+                    'reason': str(exc), 'state_fallback': bool(fallback_reason),
+                    'state_fallback_reason': fallback_reason,
+                }
+                if fallback_reason:
+                    fallback_failures.append({
+                        'account_id': rule.account_id, 'reason': fallback_reason,
+                    })
+            except (StateUnverified, CrossTradeError, ProtectionFailure, ValueError) as exc:
+                asw_pre_results[rule.account_id] = {
+                    'account_id': rule.account_id, 'status': 'SKIP',
+                    'reason': str(exc),
+                }
+
+        fallback_reservation = None
+        if fallback_failures:
+            self.store.note_state_fallback_failure(fallback_failures)
+        if fallback_failures and asw_allocations:
+            fallback_reservation = self.store.reserve_state_fallback_wave(
+                event_key or event.plan.event_id,
+                max_entry_waves=int(getattr(
+                    self.settings, 'STATE_FALLBACK_MAX_ENTRY_WAVES', 5
+                )),
+                max_duration_seconds=float(getattr(
+                    self.settings, 'STATE_FALLBACK_MAX_DURATION_SECONDS', 3600.0
+                )),
+                failures=fallback_failures,
+            )
+            if not fallback_reservation.get('allowed'):
+                decision = str(fallback_reservation.get('decision') or 'EXHAUSTED')
+                outcome = ('STATE_FALLBACK_EXPIRED'
+                           if decision == 'DURATION_EXHAUSTED'
+                           else 'STATE_FALLBACK_EXHAUSTED')
+                reason = (
+                    'transient account-state fallback blocked before broker mutation: '
+                    f'{decision}; used '
+                    f"{int(fallback_reservation.get('entry_waves_used') or 0)}/"
+                    f"{int(fallback_reservation.get('max_entry_waves') or 0)} waves"
+                )
+                self.store.trip_entry_circuit(
+                    reason=reason, event_key=event_key or event.plan.event_id,
+                    outcome=outcome,
+                )
+                return {
+                    'kind': 'ASW_WORKING_LIMIT', 'engine': 'ASW',
+                    'results': [
+                        ({'account_id': rule.account_id, 'status': 'SKIP',
+                          'reason': 'disabled'} if not rule.enabled else
+                         {'account_id': rule.account_id, 'status': 'ERROR',
+                          'reason': reason})
+                        for rule in self.accounts
+                    ],
+                    'global_execution_error': reason,
+                    'state_fallback': fallback_reservation,
+                }
+
         for rule in self.accounts:
             if not rule.enabled:
                 results.append({'account_id':rule.account_id,'status':'SKIP','reason':'disabled'}); continue
             if global_instrument_error is not None:
                 results.append({'account_id':rule.account_id,'status':'ERROR',
                                 'reason':'global instrument contract failure; fanout aborted before broker mutation: '+global_instrument_error}); continue
+            if rule.account_id in asw_pre_results:
+                results.append(asw_pre_results[rule.account_id]); continue
             try:
                 await self.entry_gate(rule)
-                state = await self.state_for(rule)
-                alloc = allocate_asw(event.plan, rule, state,
-                                    max_state_age_seconds=self.settings.MAX_STATE_AGE_SECONDS, now=now)
+                alloc = asw_allocations[rule.account_id]
                 dedupe = f'{event.plan.event_id}:{ny_date(now)}:{rule.account_id}'
                 if not self.store.claim_event(dedupe):
                     results.append({'account_id':rule.account_id,'status':'SKIP','reason':'duplicate event'}); continue
@@ -786,7 +910,9 @@ class LiveRouter:
                                 'native_qty':int(event.plan.source_qty or 0),
                                 'scale_multiple':alloc.qty / float(event.plan.source_qty or 1),
                                 'entry':alloc.entry,'stop':alloc.stop,'tp1':alloc.tp1,
-                                'expiry_time_ms':int(event.plan.expiry_time_ms)})
+                                'expiry_time_ms':int(event.plan.expiry_time_ms),
+                                'state_fallback':alloc.state_fallback,
+                                'state_fallback_reason':alloc.state_fallback_reason})
             except EntryAdmissionClosed as exc:
                 results.append({'account_id': rule.account_id, 'status': 'ABORTED',
                                 'reason': str(exc)})
@@ -800,6 +926,8 @@ class LiveRouter:
         out={'kind':'ASW_WORKING_LIMIT','engine':'ASW','results':results}
         if global_instrument_error is not None:
             out['global_execution_error']=global_instrument_error
+        if fallback_reservation is not None:
+            out['state_fallback'] = fallback_reservation
         execution_errors = [row for row in results if row.get('status') == 'ERROR']
         if execution_errors:
             reason = str(execution_errors[0].get('reason') or 'ASW execution failed')
@@ -1231,6 +1359,7 @@ class LiveRouter:
         prepared: list[tuple[AccountRule, Allocation, str, str, set[str]]] = []
         result_by_account: dict[str, dict[str, Any]] = {}
         fatal_preparation: str | None = None
+        fallback_failures: list[dict[str, str]] = []
 
         async def prepare(rule: AccountRule):
             if not rule.enabled:
@@ -1248,10 +1377,6 @@ class LiveRouter:
                     before_ids = self._snapshot_entry_gate(
                         rule, cards[rule.crosstrade_account]
                     )
-                if 'state_for' in self.__dict__:
-                    state = await self.state_for(rule)
-                else:
-                    state = self.state_for_entry(rule, now)
                 if event.plan.engine == 'ORG' and event.plan.reentry:
                     prior = self.store.get_org_attempt(rule.account_id)
                     if not prior:
@@ -1263,24 +1388,72 @@ class LiveRouter:
                         raise AllocationBlocked(
                             'ORG re-entry: destination stop outcome not proven'
                         )
-                alloc = allocate(
-                    event.plan, rule, state,
-                    max_state_age_seconds=getattr(self.settings, 'MAX_STATE_AGE_SECONDS', 20),
-                    now=now,
-                )
+                fallback_reason = ''
+                try:
+                    if 'state_for' in self.__dict__:
+                        state = await self.state_for(rule)
+                    else:
+                        state = self.state_for_entry(rule, now)
+                except (StateUnverified, CrossTradeError) as exc:
+                    if not is_transient_state_failure(exc):
+                        raise
+                    fallback_reason = str(exc)
+                    try:
+                        alloc = allocate_state_fallback(
+                            event.plan, rule, self.settings, reason=fallback_reason
+                        )
+                    except AllocationBlocked as fallback_exc:
+                        return None, {
+                            'account_id': rule.account_id, 'status': 'SKIP',
+                            'reason': str(fallback_exc), 'state_fallback': True,
+                            'state_fallback_reason': fallback_reason,
+                        }, None, {
+                            'account_id': rule.account_id, 'reason': fallback_reason,
+                        }
+                else:
+                    try:
+                        alloc = allocate(
+                            event.plan, rule, state,
+                            max_state_age_seconds=getattr(
+                                self.settings, 'MAX_STATE_AGE_SECONDS', 20
+                            ),
+                            now=now,
+                        )
+                    except AllocationBlocked as exc:
+                        if not is_transient_state_failure(exc):
+                            raise
+                        fallback_reason = str(exc)
+                        try:
+                            alloc = allocate_state_fallback(
+                                event.plan, rule, self.settings, reason=fallback_reason
+                            )
+                        except AllocationBlocked as fallback_exc:
+                            return None, {
+                                'account_id': rule.account_id, 'status': 'SKIP',
+                                'reason': str(fallback_exc), 'state_fallback': True,
+                                'state_fallback_reason': fallback_reason,
+                            }, None, {
+                                'account_id': rule.account_id, 'reason': fallback_reason,
+                            }
                 attempt_key = f'{event.plan.event_id}:{ny_date(now)}:{rule.account_id}'
                 cid = self._custom_id(attempt_key, rule.account_id)
-                return (rule, alloc, attempt_key, cid, before_ids), None, None
+                failure = ({'account_id': rule.account_id, 'reason': fallback_reason}
+                           if fallback_reason else None)
+                return (rule, alloc, attempt_key, cid, before_ids), None, None, failure
             except AllocationBlocked as exc:
                 return None, {'account_id': rule.account_id, 'status': 'SKIP',
-                              'reason': str(exc)}, None
+                              'reason': str(exc)}, None, None
             except (StateUnverified, CrossTradeError, ProtectionFailure, ValueError) as exc:
-                return None, None, f'{rule.account_id}: {exc}'
+                failure = ({'account_id': rule.account_id, 'reason': str(exc)}
+                           if is_transient_state_failure(exc) else None)
+                return None, None, f'{rule.account_id}: {exc}', failure
 
         prepared_rows = await asyncio.gather(*(prepare(rule) for rule in accounts))
-        for item, row, fatal in prepared_rows:
+        for item, row, fatal, fallback_failure in prepared_rows:
             if row is not None:
                 result_by_account[row['account_id']] = row
+            if fallback_failure is not None:
+                fallback_failures.append(fallback_failure)
             if fatal and fatal_preparation is None:
                 fatal_preparation = fatal
             if item is not None:
@@ -1297,6 +1470,47 @@ class LiveRouter:
             return {'kind': 'ENTRY', 'engine': event.plan.engine,
                     'results': [result_by_account[r.account_id] for r in accounts],
                     'global_execution_error': reason}
+
+        fallback_reservation = None
+        if fallback_failures:
+            self.store.note_state_fallback_failure(fallback_failures)
+        if fallback_failures and prepared:
+            fallback_reservation = self.store.reserve_state_fallback_wave(
+                event_key,
+                max_entry_waves=int(getattr(
+                    self.settings, 'STATE_FALLBACK_MAX_ENTRY_WAVES', 5
+                )),
+                max_duration_seconds=float(getattr(
+                    self.settings, 'STATE_FALLBACK_MAX_DURATION_SECONDS', 3600.0
+                )),
+                failures=fallback_failures,
+            )
+            if not fallback_reservation.get('allowed'):
+                decision = str(fallback_reservation.get('decision') or 'EXHAUSTED')
+                outcome = ('STATE_FALLBACK_EXPIRED'
+                           if decision == 'DURATION_EXHAUSTED'
+                           else 'STATE_FALLBACK_EXHAUSTED')
+                reason = (
+                    'transient account-state fallback blocked before broker mutation: '
+                    f'{decision}; used '
+                    f"{int(fallback_reservation.get('entry_waves_used') or 0)}/"
+                    f"{int(fallback_reservation.get('max_entry_waves') or 0)} waves"
+                )
+                self.store.trip_entry_circuit(
+                    reason=reason, event_key=event_key, outcome=outcome
+                )
+                for rule in accounts:
+                    if rule.enabled and rule.account_id not in result_by_account:
+                        result_by_account[rule.account_id] = {
+                            'account_id': rule.account_id, 'status': 'ERROR',
+                            'reason': reason,
+                        }
+                return {
+                    'kind': 'ENTRY', 'engine': event.plan.engine,
+                    'results': [result_by_account[r.account_id] for r in accounts],
+                    'global_execution_error': reason,
+                    'state_fallback': fallback_reservation,
+                }
 
         attempt_candidates: list[tuple[AccountRule, Allocation, EntryAttempt]] = []
         created_epoch = time.time()
@@ -1538,6 +1752,8 @@ class LiveRouter:
                     'runner_qty': alloc.runner_qty, 'stop': alloc.stop,
                     'tp1': alloc.tp1, 'tp2': alloc.tp2,
                     'verification': 'ASYNC_PENDING',
+                    'state_fallback': alloc.state_fallback,
+                    'state_fallback_reason': alloc.state_fallback_reason,
                 }
 
         async def submit(rule: AccountRule, alloc: Allocation,
@@ -1637,6 +1853,8 @@ class LiveRouter:
         }
         if global_instrument_error:
             out['global_execution_error'] = global_instrument_error
+        if fallback_reservation is not None:
+            out['state_fallback'] = fallback_reservation
         return out
 
     def _schedule_entry_reconcile(self, attempt: EntryAttempt, error: str) -> None:

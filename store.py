@@ -725,6 +725,177 @@ class Store:
     def entry_circuit(self) -> dict:
         return self.get_runtime_state("entry_circuit") or {"open": False}
 
+    def state_fallback_status(self) -> dict:
+        return self.get_runtime_state("state_fallback_episode") or {
+            "active": False,
+            "entry_waves_used": 0,
+            "episode_started_epoch": None,
+            "last_event_key": "",
+            "failing_accounts": [],
+        }
+
+    def note_state_fallback_failure(self, failures: list[dict] | None = None) -> dict:
+        """Start/update a durable transient-state outage without consuming a trade wave."""
+        now = time.time()
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='state_fallback_episode'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if not current.get("active"):
+                current = {
+                    "active": True,
+                    "episode_started_epoch": now,
+                    "entry_waves_used": 0,
+                    "event_keys": [],
+                }
+            current.update({
+                "active": True,
+                "last_failure_epoch": now,
+                "failing_accounts": list(failures or []),
+            })
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('state_fallback_episode',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(current, default=str),),
+            )
+            conn.commit()
+            return current
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def reserve_state_fallback_wave(self, event_key: str, *, max_entry_waves: int,
+                                    max_duration_seconds: float,
+                                    failures: list[dict] | None = None) -> dict:
+        """Atomically admit/count one signal wave, or reject before broker mutation."""
+        now = time.time()
+        event_key = str(event_key)
+        max_entry_waves = max(0, int(max_entry_waves))
+        max_duration_seconds = max(0.0, float(max_duration_seconds))
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='state_fallback_episode'"
+            ).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if not current.get("active"):
+                current = {
+                    "active": True,
+                    "episode_started_epoch": now,
+                    "entry_waves_used": 0,
+                    "event_keys": [],
+                }
+            started = float(current.get("episode_started_epoch") or now)
+            used = int(current.get("entry_waves_used") or 0)
+            keys = [str(x) for x in current.get("event_keys", [])]
+            elapsed = max(0.0, now - started)
+            if event_key and event_key in keys:
+                decision = "DUPLICATE_ALREADY_COUNTED"
+                allowed = True
+            elif max_duration_seconds <= 0 or elapsed >= max_duration_seconds:
+                decision = "DURATION_EXHAUSTED"
+                allowed = False
+            elif used >= max_entry_waves:
+                decision = "WAVE_LIMIT_EXHAUSTED"
+                allowed = False
+            else:
+                used += 1
+                if event_key:
+                    keys.append(event_key)
+                    keys = keys[-max(10, max_entry_waves + 2):]
+                decision = "FALLBACK_WAVE_RESERVED"
+                allowed = True
+            current.update({
+                "active": True,
+                "episode_started_epoch": started,
+                "entry_waves_used": used,
+                "event_keys": keys,
+                "last_event_key": event_key,
+                "last_reservation_epoch": now,
+                "failing_accounts": list(failures or current.get("failing_accounts") or []),
+                "max_entry_waves": max_entry_waves,
+                "max_duration_seconds": max_duration_seconds,
+                "elapsed_seconds": elapsed,
+                "last_decision": decision,
+            })
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('state_fallback_episode',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(current, default=str),),
+            )
+            conn.commit()
+            return {**current, "allowed": allowed, "decision": decision}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def recover_state_fallback(self) -> dict:
+        """Clear a recovered episode and only a circuit owned by state fallback/warm-up."""
+        now = time.time()
+        recovered = {
+            "active": False,
+            "entry_waves_used": 0,
+            "episode_started_epoch": None,
+            "last_event_key": "",
+            "failing_accounts": [],
+            "recovered_at_epoch": now,
+        }
+        conn = self._connect(timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO runtime_state(key,payload) VALUES('state_fallback_episode',?) "
+                "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                (json.dumps(recovered, default=str),),
+            )
+            row = conn.execute(
+                "SELECT payload FROM runtime_state WHERE key='entry_circuit'"
+            ).fetchone()
+            circuit = json.loads(row[0]) if row else {"open": False}
+            owned_outcomes = {
+                "STATE_FALLBACK_EXHAUSTED", "STATE_FALLBACK_EXPIRED",
+                "STARTUP_STATE_CACHE_UNREADY",
+            }
+            circuit_outcome = str(circuit.get("outcome") or "")
+            circuit_reason = str(circuit.get("reason") or "").lower()
+            legacy_transient_preparation = (
+                circuit_outcome == "PREPARATION_FAILED"
+                and any(marker in circuit_reason for marker in (
+                    "readtimeout", "connecttimeout", "network error", "timed out",
+                    "timeout", "snapshot_refresh_pending", "entry state cache stale",
+                    "entry state cache is not initialized",
+                ))
+            )
+            if (circuit.get("open") and
+                    (circuit_outcome in owned_outcomes or legacy_transient_preparation)):
+                reset = {
+                    "open": False, "reason": "", "event_key": "", "outcome": "",
+                    "reset_at_epoch": now, "reset_reason": "verified state refresh recovered",
+                }
+                conn.execute(
+                    "INSERT INTO runtime_state(key,payload) VALUES('entry_circuit',?) "
+                    "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                    (json.dumps(reset, default=str),),
+                )
+                recovered["entry_circuit_auto_reset"] = True
+            else:
+                recovered["entry_circuit_auto_reset"] = False
+            conn.commit()
+            return recovered
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def unresolved_entry_attempt_count(self) -> int:
         with self.db() as c:
             row = c.execute(

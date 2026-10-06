@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytest
-from allocation import allocate, AllocationBlocked
+from allocation import allocate, allocate_asw, AllocationBlocked
 from models import AccountRule, AccountState, CanonicalPlan
 
 NOW=datetime.now(timezone.utc)
@@ -42,3 +42,13 @@ def test_core_destination_split_is_from_destination_qty():
     plan=CanonicalPlan(event_id="e",engine="CORE",side="LONG",entry=100,stop=90,tp1=120,tp2=140,module="CORE",source="ORL",score=4)
     a=allocate(plan,personal(),state(),now=NOW)
     assert (a.tp1_qty,a.runner_qty)==((a.qty+1)//2,a.qty//2)
+
+def test_realized_loss_below_old_1_8r_threshold_does_not_block_allocation():
+    plan=CanonicalPlan(event_id="e",engine="SILVER",side="LONG",entry=100,stop=90,tp1=120)
+    a=allocate(plan,personal(),state(realized_today=-1000),now=NOW)
+    assert a.qty >= 1
+
+def test_realized_loss_below_old_1_8r_threshold_does_not_block_asw():
+    plan=CanonicalPlan(event_id="e",engine="ASW",side="LONG",entry=100,stop=90,tp1=120,source_qty=1,contract_risk_dollars=20,native_time_ms=int(NOW.timestamp()*1000),expiry_time_ms=int((NOW+timedelta(minutes=45)).timestamp()*1000),contract_version="ASW_LIMIT_V1")
+    a=allocate_asw(plan,personal(),state(realized_today=-1000),now=NOW)
+    assert a.qty == 1

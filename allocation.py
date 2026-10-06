@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from models import AccountRule, AccountState, Allocation, CanonicalPlan
 from parity import (
     MNQ_POINT_VALUE, challenge_effective_target, challenge_planning_ceiling,
-    challenge_risk, funded_postlock_risk, funded_prelock_risk, daily_loss_limit,
+    challenge_risk, funded_postlock_risk, funded_prelock_risk,
     consistency_qty, consistency_target, core_consistency_qty, core_consistency_targets,
     core_risk_multiplier, addon_risk_multiplier, engine_contract_cap, natural_qty,
     risk_per_contract, core_split, consistency_room, funded_one_contract_max_risk,
@@ -105,8 +105,6 @@ def allocate(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
     base_risk, cushion, consistency_base_target, consistency_enabled, ceiling = _base_risk(rule, state)
     if base_risk <= 0:
         raise AllocationBlocked("no active risk budget")
-    if state.realized_today <= -daily_loss_limit(base_risk):
-        raise AllocationBlocked("daily loss limit reached")
 
     engine = plan.engine
     risk_mult = 1.0
@@ -195,8 +193,6 @@ def allocate_asw(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
     base_risk, cushion, consistency_base_target, consistency_enabled, ceiling = _base_risk(rule, state)
     if base_risk <= 0:
         raise AllocationBlocked("no active risk budget")
-    if state.realized_today <= -daily_loss_limit(base_risk):
-        raise AllocationBlocked("daily loss limit reached")
 
     native_qty = int(plan.source_qty or 0)
     if native_qty < 1:

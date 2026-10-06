@@ -15,7 +15,6 @@ MNQ_TICK_SIZE = 0.25
 CONSISTENCY_MIN_PROFIT_ROOM = 50.0
 FUNDED_MINIMUM_LOSS_BUFFER_R = 12.0
 LOW_CUSHION_ONE_CONTRACT_PCT = 35.0
-DAILY_LOSS_R = 1.8
 
 Profile = Literal["standard", "aggressive"]
 Drawdown = Literal["static", "eod", "live"]
@@ -118,10 +117,6 @@ def funded_core_safe_qty(*, cushion: float, risk_per_contract: float) -> int:
     if risk_per_contract <= 0 or cushion <= 0:
         return 0
     return pine_round_positive((cushion / FUNDED_MINIMUM_LOSS_BUFFER_R) / risk_per_contract)
-
-
-def daily_loss_limit(active_base_risk: float) -> float:
-    return active_base_risk * DAILY_LOSS_R
 
 
 def consistency_room(*, realized_today: float, enabled: bool, ceiling_fraction: float, base_target: float) -> float:

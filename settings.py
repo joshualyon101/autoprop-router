@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     SILVER_MANAGEMENT_RETRY_MAX_SECONDS: float = 5.0
     ENTRY_STATE_CACHE_MAX_AGE_SECONDS: float = 20.0
     STARTUP_STATE_WARM_TIMEOUT_SECONDS: float = 20.0
+    # A transient broker state-read outage may use conservative configuration-only
+    # sizing for at most five entry waves and at most one hour. The sixth fallback wave,
+    # or the first wave after the time limit, trips the new-risk circuit. A complete live
+    # refresh resets the episode automatically. Auth/config/account-status errors never
+    # qualify for fallback.
+    STATE_FALLBACK_ENABLED: bool = True
+    STATE_FALLBACK_MAX_ENTRY_WAVES: int = 5
+    STATE_FALLBACK_MAX_DURATION_SECONDS: float = 3600.0
+    STATE_FALLBACK_CHALLENGE_MAX_LOSS_PCT: float = 10.0
+    STATE_FALLBACK_FUNDED_MAX_LOSS_PCT: float = 7.5
+    STATE_FALLBACK_PERSONAL_RISK_MULTIPLIER: float = 0.5
     AUTOPROP_LIVE_ARM: str = ''
     AUTOPROP_FULL_SCALE_ARM: str = ''
     TRADINGVIEW_ALERT_CONTRACT_VERIFIED: bool = False

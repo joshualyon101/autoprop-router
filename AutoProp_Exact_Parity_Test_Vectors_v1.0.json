@@ -5,7 +5,6 @@
   "constants": {
     "mnq_point_value": 2.0,
     "mnq_tick_size": 0.25,
-    "daily_loss_r": 1.8,
     "consistency_min_profit_room": 50.0,
     "funded_minimum_loss_buffer_r": 12.0,
     "funded_low_cushion_one_contract_pct": 35.0
@@ -49,7 +48,6 @@
     ]
   },
   "daily_consistency": {
-    "daily_loss": {"base_risk":562.5,"expected_limit":1012.5},
     "room": [
       {"base_target":6000.0,"ceiling":0.4,"realized_today":-500.0,"expected_room":2900.0,"allow":true},
       {"base_target":6000.0,"ceiling":0.4,"realized_today":2300.0,"expected_room":100.0,"allow":true},

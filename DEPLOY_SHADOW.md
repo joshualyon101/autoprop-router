@@ -15,7 +15,7 @@ AUTOPROP_FULL_SCALE_ARM=
 
 Keep the shadow database on persistent storage and separate from the live Router database. Deploy the contents of the ZIP's top-level folder, which contains the Dockerfile and railway.toml. This delivered package has not been deployed on your behalf.
 
-After deployment, `/health` must report version `1.2.8.12-shadow-observer-org-breadth` and:
+After deployment, `/health` must report version `1.2.8.14-bounded-state-fallback-rc1` and:
 
 ```json
 {
