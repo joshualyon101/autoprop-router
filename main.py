@@ -22,6 +22,7 @@ from state import StateUnverified, ny_date
 from store import Store
 from crosstrade import InstrumentContractError, normalize_tradovate_symbol
 from management import SILVER_STOP_CONTRACT
+from dwc_protection import DWC_STOP_CONTRACT, blocks_new_entry as dwc_blocks_new_entry
 from onboarding import discover_and_onboard
 from shadow import ShadowObserver
 from state_fallback import is_transient_state_failure
@@ -47,6 +48,7 @@ _control_worker_wakeup: asyncio.Event | None = None
 _asw_reconcile_task: asyncio.Task | None = None
 _entry_reconcile_task: asyncio.Task | None = None
 _silver_management_task: asyncio.Task | None = None
+_dwc_management_task: asyncio.Task | None = None
 _state_refresh_task: asyncio.Task | None = None
 _auto_discovery_task: asyncio.Task | None = None
 _auto_discovery_lock: asyncio.Lock | None = None
@@ -134,6 +136,8 @@ async def _process_event(event, *, event_key: str = '', receipt_epoch: float | N
         return await rt.market_pulse(event)
     if event.kind == 'SILVER_STOP_MOVE':
         return await rt.silver_stop(event, event_key=event_key)
+    if event.kind == 'DWC_STOP_MOVE':
+        return await rt.dwc_stop(event, event_key=event_key)
     if event.kind == 'HARD_FLAT':
         return await rt.hard_flat(event)
     if event.kind == 'EXIT':
@@ -180,6 +184,8 @@ async def _webhook_worker(*, control: bool = False):
                     raise RuntimeError('new-risk blocked: prior entry attempt is unresolved')
                 if new_risk and store.silver_stop_intent():
                     raise RuntimeError('new-risk blocked: Silver protection intent is pending')
+                if new_risk and dwc_blocks_new_entry(store, event):
+                    raise RuntimeError('new-risk blocked: DWC protection intent is pending')
             if new_risk and base is not None and not base['configuration_ready']:
                 raise RuntimeError(f"router configuration not ready: {base['problems']}")
             result = _annotate_execution_result(await _process_event(
@@ -276,6 +282,26 @@ async def _silver_management_loop():
             pass
 
 
+async def _dwc_management_loop():
+    """Service only persisted DWC intents; an idle loop performs no broker reads."""
+    while True:
+        rt = _runtime()
+        wakeup = rt.dwc_management_wakeup
+        wakeup.clear()
+        try:
+            result = await rt.service_dwc_stop_intents()
+            if result.get('status') not in {'IDLE', 'BACKOFF'}:
+                logger.info('DWC priority management %s', result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('DWC priority management failed')
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=max(0.25, float(settings.SILVER_MANAGEMENT_LOOP_SECONDS)))
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _state_refresh_loop():
     while True:
         delay = max(1.0, float(settings.STATE_POLL_SECONDS))
@@ -360,7 +386,7 @@ async def _auto_discovery_loop():
 @app.on_event('startup')
 async def _start_worker():
     global _worker_task, _control_worker_task, _worker_wakeup, _control_worker_wakeup
-    global _asw_reconcile_task, _entry_reconcile_task, _silver_management_task
+    global _asw_reconcile_task, _entry_reconcile_task, _silver_management_task, _dwc_management_task
     global _state_refresh_task
     global _auto_discovery_task
     store.recover_processing_webhooks()
@@ -442,6 +468,9 @@ async def _start_worker():
     _silver_management_task = asyncio.create_task(
         _silver_management_loop(), name='autoprop-silver-management'
     )
+    _dwc_management_task = asyncio.create_task(
+        _dwc_management_loop(), name='autoprop-dwc-management'
+    )
     _state_refresh_task = asyncio.create_task(
         _state_refresh_loop(), name='autoprop-state-refresh'
     )
@@ -454,12 +483,12 @@ async def _start_worker():
 @app.on_event('shutdown')
 async def _stop_worker():
     global _worker_task, _control_worker_task, _asw_reconcile_task
-    global _entry_reconcile_task, _silver_management_task
+    global _entry_reconcile_task, _silver_management_task, _dwc_management_task
     global _state_refresh_task, _auto_discovery_task
     global _runtime_instance, _shadow_instance, _auto_discovery_lock
     global _worker_wakeup, _control_worker_wakeup
     tasks = [_worker_task, _control_worker_task, _asw_reconcile_task,
-             _entry_reconcile_task, _silver_management_task,
+             _entry_reconcile_task, _silver_management_task, _dwc_management_task,
              _state_refresh_task, _auto_discovery_task]
     for task in tasks:
         if task is not None:
@@ -476,6 +505,7 @@ async def _stop_worker():
     _asw_reconcile_task = None
     _entry_reconcile_task = None
     _silver_management_task = None
+    _dwc_management_task = None
     _state_refresh_task = None
     _auto_discovery_task = None
     _auto_discovery_lock = None
@@ -566,7 +596,7 @@ def health():
     state_fallback = store.state_fallback_status()
     broker_armed = False if _SHADOW_MODE else (
         base['broker_mutation_armed'] and not circuit.get('open') and unresolved == 0
-        and not silver_intent
+        and not silver_intent and not store.dwc_stop_pending()
     )
     return {
         'ok': True,
@@ -604,6 +634,9 @@ def health():
         'active_trades': len(store.all_trades()),
         'asw_limit_contract': 'ASW_LIMIT_V1',
         'silver_stop_contract': SILVER_STOP_CONTRACT,
+        'dwc_stop_contract': DWC_STOP_CONTRACT,
+        'dwc_management_pending': store.dwc_stop_pending(),
+        'dwc_management_intent_count': len(store.pending_dwc_stop_intents()),
         'asw_pending_limits': len(store.all_asw_pending()),
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
@@ -936,6 +969,8 @@ async def reset_entry_circuit(token: str):
         raise HTTPException(409, 'managed trades/pending limits must be flat first')
     if store.silver_stop_intent():
         raise HTTPException(409, 'Silver protection intent must finish before circuit reset')
+    if store.dwc_stop_pending():
+        raise HTTPException(409, 'DWC protection intent must finish before circuit reset')
     rt = _runtime()
     wave_marker = getattr(rt, 'entry_wave_active', None)
     if wave_marker is not None and wave_marker.is_set():
@@ -1120,6 +1155,9 @@ async def webhook(token: str, request: Request):
             'silver_stop_intent': store.silver_stop_intent(),
         })
 
+    if new_risk and dwc_blocks_new_entry(store, event):
+        raise HTTPException(503, {'reason': 'DWC protection intent is pending'})
+
     base = readiness(settings, _accounts()) if new_risk else None
     if new_risk and base is not None and not base['configuration_ready']:
         raise HTTPException(503, {'reason': 'router configuration not ready', 'problems': base['problems']})
@@ -1133,7 +1171,7 @@ async def webhook(token: str, request: Request):
     control_kinds = {'EXIT', 'HARD_FLAT', 'ASW_CANCEL_PENDING', 'ASW_TIME_FLAT'}
     priority = {
         'HARD_FLAT': 100, 'ASW_TIME_FLAT': 100, 'ASW_CANCEL_PENDING': 95,
-        'EXIT': 90, 'SILVER_STOP_MOVE': 80, 'MARKET_PULSE': 10,
+        'EXIT': 90, 'SILVER_STOP_MOVE': 80, 'DWC_STOP_MOVE': 80, 'MARKET_PULSE': 10,
         'ENTRY': 10, 'ASW_WORKING_LIMIT': 10,
     }.get(event.kind, 10)
     if event.kind in control_kinds:

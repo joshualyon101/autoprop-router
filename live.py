@@ -27,6 +27,7 @@ from state_fallback import (
 )
 from store import Store
 from entry_recovery import recover_readback_circuit
+from dwc_protection import record_intent as record_dwc_intent, service_intents as service_dwc_intents
 
 
 def _rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -52,6 +53,8 @@ class LiveRouter:
         self.store = store
         self.entry_wave_active = asyncio.Event()
         self.silver_management_wakeup = asyncio.Event()
+        self.dwc_management_wakeup = asyncio.Event()
+        self.dwc_management_lock = asyncio.Lock()
         self._entry_reconcile_lock = asyncio.Lock()
         self._state_refresh_locks: dict[str, asyncio.Lock] = {}
         self._state_refresh_batch_lock = asyncio.Lock()
@@ -104,7 +107,8 @@ class LiveRouter:
         if pending_fn is not None and pending_fn():
             return True
         intent_fn = getattr(self.store, 'silver_stop_intent', None)
-        return bool(intent_fn is not None and intent_fn())
+        dwc_fn = getattr(self.store, 'dwc_stop_pending', None)
+        return bool((intent_fn is not None and intent_fn()) or (dwc_fn is not None and dwc_fn()))
 
     @staticmethod
     def _position_identity(row: dict[str, Any]) -> tuple[str, str]:
@@ -1527,6 +1531,8 @@ class LiveRouter:
                 tp1=alloc.tp1, tp2=alloc.tp2, tp1_qty=alloc.tp1_qty,
                 runner_qty=alloc.runner_qty, custom_order_id=cid,
                 entry_native_bar_index=event.plan.native_bar_index,
+                management_signal_time_ms=event.plan.native_time_ms if alloc.engine == 'DWC' else None,
+                management_contract=event.plan.contract_version if alloc.engine == 'DWC' else '',
                 entry_receipt_epoch=receipt_epoch, inbox_event_key=event_key,
                 preexisting_order_ids=sorted(before_ids),
                 created_at_epoch=created_epoch, updated_at_epoch=created_epoch,
@@ -2327,6 +2333,8 @@ class LiveRouter:
                 tp1_qty=current.tp1_qty, runner_qty=current.runner_qty,
                 current_position_qty=abs(signed), previous_position_qty=abs(signed),
                 entry_native_bar_index=current.entry_native_bar_index,
+                management_signal_time_ms=current.management_signal_time_ms,
+                management_contract=current.management_contract,
                 stop_order_ids=list(current.stop_order_ids),
                 target_order_ids=list(current.target_order_ids),
                 parent_order_id=current.parent_order_id,
@@ -2446,6 +2454,12 @@ class LiveRouter:
                 'reason': 'CORE management remains unconfirmed; retrying flat proof',
             })
         return out
+
+    async def dwc_stop(self, event: ParsedEvent, *, event_key: str = '') -> dict:
+        return await record_dwc_intent(self, event, event_key)
+
+    async def service_dwc_stop_intents(self) -> dict:
+        return await service_dwc_intents(self)
 
     async def silver_stop(self, event: ParsedEvent, *, event_key: str = '') -> dict:
         """Persist the highest requested stage; a dedicated loop owns broker mutation.

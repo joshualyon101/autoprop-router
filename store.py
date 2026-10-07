@@ -94,6 +94,7 @@ class Store:
                     "ALTER TABLE control_fences ADD COLUMN kind TEXT NOT NULL DEFAULT 'EXIT'"
                 )
             c.execute("CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            c.execute("CREATE TABLE IF NOT EXISTS dwc_stop_intents (signal_id INTEGER PRIMARY KEY, pending INTEGER NOT NULL, payload TEXT NOT NULL)")
             c.execute("""CREATE TABLE IF NOT EXISTS webhook_inbox (
                 event_key TEXT PRIMARY KEY,
                 raw TEXT NOT NULL,
@@ -753,11 +754,12 @@ class Store:
                     or conn.execute("SELECT 1 FROM asw_pending LIMIT 1").fetchone()
                     or conn.execute("SELECT 1 FROM webhook_inbox WHERE status IN ('PENDING','PROCESSING') "
                                     "AND kind IN ('EXIT','HARD_FLAT','ASW_CANCEL_PENDING',"
-                                    "'ASW_TIME_FLAT','SILVER_STOP_MOVE') LIMIT 1").fetchone())
+                                    "'ASW_TIME_FLAT','SILVER_STOP_MOVE','DWC_STOP_MOVE') LIMIT 1").fetchone())
             intent_row = conn.execute(
                 "SELECT payload FROM runtime_state WHERE key='silver_stop_intent'"
             ).fetchone()
-            if busy or (intent_row and json.loads(intent_row[0]).get('pending')):
+            dwc_pending = conn.execute("SELECT 1 FROM dwc_stop_intents WHERE pending=1 LIMIT 1").fetchone()
+            if busy or dwc_pending or (intent_row and json.loads(intent_row[0]).get('pending')):
                 conn.rollback()
                 return None
             now = time.time()
@@ -1434,3 +1436,82 @@ class Store:
                     count = None
                 out.append({'table': name, 'rows': count})
         return out
+
+    # DWC management is keyed by immutable Pine signal time, not by account/engine alone.
+    # Completed IDs stay as tombstones so a delayed duplicate cannot re-arm protection.
+    def record_dwc_stop_intent(self, signal_id: int, event_key: str, fields: dict) -> dict:
+        signal_id = int(signal_id)
+        payload = {'signal_id': signal_id, 'pending': True, 'stage': 1,
+                   'event_key': event_key, 'fields': dict(fields),
+                   'created_at_epoch': time.time(), 'next_attempt_at_epoch': 0.0,
+                   'attempts': 0, 'accounts': {}, 'status': 'PENDING'}
+        with self.db() as c:
+            c.execute("INSERT OR IGNORE INTO dwc_stop_intents(signal_id,pending,payload) VALUES(?,1,?)",
+                      (signal_id, json.dumps(payload)))
+            row = c.execute("SELECT payload FROM dwc_stop_intents WHERE signal_id=?", (signal_id,)).fetchone()
+        return json.loads(row[0])
+
+    def get_dwc_stop_intent(self, signal_id: int) -> dict:
+        with self.db() as c:
+            row = c.execute("SELECT payload FROM dwc_stop_intents WHERE signal_id=?", (int(signal_id),)).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    def pending_dwc_stop_intents(self) -> list[dict]:
+        with self.db() as c:
+            rows = c.execute("SELECT payload FROM dwc_stop_intents WHERE pending=1 ORDER BY signal_id").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def dwc_stop_pending(self, exclude_signal_id: int | None = None) -> bool:
+        with self.db() as c:
+            row = c.execute("SELECT 1 FROM dwc_stop_intents WHERE pending=1 AND signal_id!=? LIMIT 1",
+                            (-1 if exclude_signal_id is None else int(exclude_signal_id),)).fetchone()
+        return row is not None
+
+    def _update_dwc_stop_intent(self, signal_id: int, update: dict, *,
+                                account_id: str = '', account_update: dict | None = None) -> None:
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute("SELECT payload FROM dwc_stop_intents WHERE signal_id=?", (int(signal_id),)).fetchone()
+            if row is None:
+                raise ValueError('DWC intent does not exist')
+            payload = json.loads(row[0])
+            if not payload.get('pending'):
+                return
+            payload.update(update)
+            if account_id:
+                previous = payload.setdefault('accounts', {}).get(account_id, {})
+                previous.update(account_update or {})
+                payload['accounts'][account_id] = previous
+            c.execute("UPDATE dwc_stop_intents SET pending=?,payload=? WHERE signal_id=?",
+                      (int(bool(payload['pending'])), json.dumps(payload), int(signal_id)))
+
+    def mark_dwc_stop_account(self, signal_id: int, account_id: str, **state) -> None:
+        self._update_dwc_stop_intent(signal_id, {}, account_id=account_id, account_update=state)
+
+    def defer_dwc_stop_intent(self, signal_id: int, delay: float, reason: str) -> None:
+        intent = self.get_dwc_stop_intent(signal_id)
+        self._update_dwc_stop_intent(signal_id, {
+            'attempts': int(intent.get('attempts', 0)) + 1,
+            'next_attempt_at_epoch': time.time() + max(0.05, delay), 'last_error': reason[:2000]})
+
+    def complete_dwc_stop_intent(self, signal_id: int, status: str) -> None:
+        self._update_dwc_stop_intent(signal_id, {'pending': False, 'status': status,
+                                               'completed_at_epoch': time.time()})
+
+    def save_dwc_trade_if_current(self, trade: ActiveTrade) -> bool:
+        """Compare-and-set: never resurrect a closed trade or overwrite a newer generation."""
+        from dwc_protection import DWC_STOP_CONTRACT
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute("SELECT payload FROM active_trades WHERE account_id=?", (trade.account_id,)).fetchone()
+            if row is None:
+                return False
+            old = ActiveTrade.model_validate_json(row[0])
+            if (old.event_id != trade.event_id or old.engine != 'DWC' or old.side != 'SHORT'
+                    or old.management_contract != DWC_STOP_CONTRACT
+                    or old.management_signal_time_ms != trade.management_signal_time_ms
+                    or trade.current_stop > old.current_stop or trade.stop_stage < old.stop_stage):
+                return False
+            c.execute("UPDATE active_trades SET payload=? WHERE account_id=?",
+                      (trade.model_dump_json(), trade.account_id))
+            return True

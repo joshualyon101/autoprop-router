@@ -1,0 +1,57 @@
+{
+  "release": "1.2.8.17-dwc-sb2505-rc1",
+  "base_version": "1.2.8.16-live-org-breadth-rc1",
+  "base_repository": "joshualyon101/autoprop-router",
+  "base_commit": "81cbaacba330fe8e5c434d329bed66eb8efe12a5",
+  "kind": "changed-files overlay, no account/settings/database replacement",
+  "files": {
+    "__init__.py": {
+      "sha256_before": "d0c3478a819a9e490426a602e75b87bc4d6f913de49a6b1c2433d02b8cf63f13",
+      "sha256_after": "3439c4e85b7a30e0ebb16212099c250ba7c5026a5f60233349075dcd6288a319"
+    },
+    "version.py": {
+      "sha256_before": "f4e1bbfd2eaccdfc1354c98e4de1eacea96394ded064f07ff807684d8f061202",
+      "sha256_after": "d76442edfbb8fcca1d36121b208de61e4809b9c85b77ea74937278c4cf7cd743"
+    },
+    "models.py": {
+      "sha256_before": "31d9a4800792ae8ddf69ea270b2f254aa863ab6bedbe46a9aefe95784434b6b4",
+      "sha256_after": "7f289d9dca5efbf31dafe832bcd8ed5edeb4dc80ba62c38e56318cb5b02e31b2"
+    },
+    "events.py": {
+      "sha256_before": "1a9810470fda0040cc046d217b93b5b6f4af9aa14a145c2dc5ad072880d633df",
+      "sha256_after": "862e77c5b29db1074c596156a1803b7157e24b10cf86d9b1167b4b851b6ab1bc"
+    },
+    "live.py": {
+      "sha256_before": "d2f7f091ea1fbe2763538ac306659eb3ab8d3770798f3732e3ed36680c0bf2ad",
+      "sha256_after": "92fec0787cfe9263cff283ceb104643e2ba896cc7d9584afbc48e70ed827e713"
+    },
+    "execution.py": {
+      "sha256_before": "35d7f59768efda9422aa920904d5243993cffe067c561742543c4573f403d5fc",
+      "sha256_after": "2538aba2db49a44ba177e49a35821be54f67c38d7c1be0dec8f2545e7ed039fb"
+    },
+    "store.py": {
+      "sha256_before": "0ac6103849713db3bbee66fcb83271f15f7dc1e0c1e61d52dfc49b0c70892a0a",
+      "sha256_after": "3153e69e0d4c729122f24852861dcc7d2ac0b949452cf47ceb08fdd4cc7f2e0a"
+    },
+    "main.py": {
+      "sha256_before": "4d86f510c534be4b53d059dfe69f110629eb4e738879541c08c8f8ba2207f38f",
+      "sha256_after": "c757b4c471eac86325375690f4e2894628506ae18d45b38822cb5e87fb671f3d"
+    },
+    "shadow.py": {
+      "sha256_before": "fd612ad6317cb9a121136bc2993aff60863216e3fb2851c9a3b5a8612be3c39c",
+      "sha256_after": "f71ede6dcea580fa7d7b4273a2fb2f3e5fce5488a6d24a4b66a618259d362d83"
+    },
+    "dwc_protection.py": {
+      "sha256_before": null,
+      "sha256_after": "b5a83d2848138e56697210acfc757338c30de1baa322b6ce880a0eb8d5b09678"
+    },
+    "test_dwc_sb2505_v1_2_8_17.py": {
+      "sha256_before": null,
+      "sha256_after": "426d1e092217351dd3df1a14dfdea4151ccdf1c2b581b793524f925334b6f6d1"
+    },
+    "DEPLOY_DWC_SB2505_RC1.md": {
+      "sha256_before": null,
+      "sha256_after": "cc91d923f1d39857240799d0e1b5263e81896414a647b7f82dcc3a3a91c01355"
+    }
+  }
+}

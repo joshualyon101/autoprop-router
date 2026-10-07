@@ -1062,7 +1062,9 @@ class Executor:
                 [_order_id(o) for o in stops if _order_id(o)])
 
     async def change_stop_orders(self, account: str, stop_order_ids: list[str],
-                                 new_stop: float, expected_qty: int) -> list[str]:
+                                 new_stop: float, expected_qty: int, *,
+                                 still_current=None) -> list[str]:
+        self._require_current(still_current)
         rows: list[dict[str, Any]] = []
         for oid in stop_order_ids:
             snap = await self._order_snapshot(account, str(oid))
@@ -1074,7 +1076,8 @@ class Executor:
             raise ProtectionFailure('owned working stop coverage does not match live position')
         for o in live:
             await self._change_exact(account, _order_id(o),
-                                     {'qty': _qty(o), 'orderType': 'stop', 'stopPrice': new_stop})
+                                     {'qty': _qty(o), 'orderType': 'stop', 'stopPrice': new_stop},
+                                     still_current=still_current)
         check: list[dict[str, Any]] = []
         for o in live:
             snap = await self._order_snapshot(account, _order_id(o))
@@ -1084,4 +1087,5 @@ class Executor:
         exact = [o for o in s2 if tick_equal(_price(o, 'stop'), new_stop)]
         if sum(_qty(o) for o in exact) != int(expected_qty):
             raise ProtectionFailure('stop change exact readback/coverage failed')
+        self._require_current(still_current)
         return [_order_id(o) for o in exact if _order_id(o)]

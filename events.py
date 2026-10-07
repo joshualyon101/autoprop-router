@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from models import CanonicalPlan, MarketPulse
+from dwc_protection import validate_dwc_fields
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,15 @@ def parse_alert(raw: str) -> ParsedEvent:
             raise ValueError("ASW TIME_FLAT missing contract/side")
         return ParsedEvent(kind="ASW_TIME_FLAT", engine=engine, side=side, fields=d, raw=raw)
 
+    if engine == "DWC" and (action in {"MOVE_STOP", "STOP_MOVE"} or
+                            (action == "ENTRY" and ("CONTRACT" in d or "DWC_ID" in d))):
+        keys = [p.split("=", 1)[0] for p in parts[4:] if "=" in p]
+        if len(keys) != len(set(keys)):
+            raise ValueError("DWC duplicated contract field")
+        validate_dwc_fields(d, side, move=action != "ENTRY")
+        if action != "ENTRY":
+            return ParsedEvent(kind="DWC_STOP_MOVE", engine="DWC", side=side, fields=d, raw=raw)
+
     if action == "ENTRY" and engine in {"ORG", "SILVER", "TGIF", "DWC"}:
         entry = _f(d, "ENTRY", "REF")
         stop = _f(d, "SL")
@@ -150,7 +160,9 @@ def parse_alert(raw: str) -> ParsedEvent:
                              entry=entry, stop=stop, tp1=target,
                              reentry=d.get("REENTRY") == "1",
                              reentry_type=d.get("TYPE", ""), source_qty=_i(d, "QTY", "Q"),
-                             org_regime_fields=org_regime_fields)
+                             org_regime_fields=org_regime_fields,
+                             native_time_ms=_i(d, "DWC_ID") if engine == "DWC" else None,
+                             contract_version=d.get("CONTRACT", "") if engine == "DWC" else "")
         return ParsedEvent(kind="ENTRY", plan=plan, engine=engine, side=side, fields=d, raw=raw)
 
     if engine == "SILVER" and action in {"MOVE_STOP", "STOP_MOVE"}:

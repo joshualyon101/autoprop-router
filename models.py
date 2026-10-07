@@ -196,6 +196,8 @@ class ActiveTrade(BaseModel):
     current_position_qty: int
     previous_position_qty: int
     entry_native_bar_index: Optional[int] = None
+    management_signal_time_ms: Optional[int] = None
+    management_contract: str = ""
     stop_stage: int = 0
     tp1_filled: bool = False
     stop_order_ids: list[str] = []
@@ -233,6 +235,8 @@ class EntryAttempt(BaseModel):
     runner_qty: int
     custom_order_id: str
     entry_native_bar_index: Optional[int] = None
+    management_signal_time_ms: Optional[int] = None
+    management_contract: str = ""
     entry_receipt_epoch: float = 0.0
     inbox_event_key: str = ""
     state: EntryAttemptState = "PREPARED"
