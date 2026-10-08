@@ -127,6 +127,10 @@ def _closed_cash(detail: dict[str, Any]) -> float:
     candidates: list[Any] = []
     if isinstance(balance, dict):
         candidates.extend((
+            # Current CrossTrade Tradovate account-detail schema. totalCashValue
+            # is the closed cash basis; cashUSD is a compatible cash fallback.
+            # netLiq is intentionally excluded because it can include open P&L.
+            balance.get("totalCashValue"), balance.get("cashUSD"),
             balance.get("amount"), balance.get("cashBalance"),
             balance.get("cash_balance"), balance.get("closedCashBalance"),
         ))
