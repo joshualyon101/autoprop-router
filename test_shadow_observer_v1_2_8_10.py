@@ -102,3 +102,4 @@ async def test_every_control_and_management_kind_is_observational_and_counted():
     summary = store.runtime["shadow_observer_summary"]
     assert summary["total_events"] == len(events)
     assert summary["counts"] == {event.kind: 1 for event in events}
+

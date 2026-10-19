@@ -200,3 +200,4 @@ class Store:
     def list_registry(self):
         with self._conn() as c:
             return [dict(r) for r in c.execute("SELECT * FROM account_registry ORDER BY firm,account_name").fetchall()]
+

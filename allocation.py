@@ -296,3 +296,4 @@ def allocate_asw(plan: CanonicalPlan, rule: AccountRule, state: AccountState,
                       tp1=plan.tp1, tp2=None, tp1_qty=qty, runner_qty=0,
                       base_risk=base_risk, effective_risk_budget=base_risk,
                       risk_per_contract=rpc)
+

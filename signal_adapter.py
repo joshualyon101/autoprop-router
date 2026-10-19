@@ -118,3 +118,4 @@ def normalize_payload(raw: bytes, content_type: str | None = None) -> TradeSigna
     if "|" in text:
         return normalize_pipe(text)
     raise ValueError("plain-English TradingView alerts are intentionally rejected for live routing; use structured JSON or AutoProp pipe format")
+

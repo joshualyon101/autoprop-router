@@ -217,3 +217,4 @@ async def test_live_route_uses_five_fallback_waves_then_blocks_before_sixth_plac
     assert router.executor.calls == 5
     assert store.entry_circuit()["open"] is True
     assert store.entry_circuit()["outcome"] == "STATE_FALLBACK_EXHAUSTED"
+

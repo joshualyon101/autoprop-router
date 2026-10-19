@@ -250,3 +250,4 @@ async def test_verified_receipt_carries_roles_without_second_lifecycle_pass():
     assert receipt.target_order_ids == ["t1"]
     assert receipt.stop_order_ids == ["s1"]
     assert client.lifecycle_calls == 0
+

@@ -254,3 +254,4 @@ class ShadowObserver:
         )
         result["shadow_total_events"] = summary["total_events"]
         return result
+

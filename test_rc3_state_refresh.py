@@ -35,3 +35,4 @@ async def test_runtime_durable_fill_read_proves_daily_ledger_even_if_staged_flag
     assert state.mll_floor == 48000
     assert state.daily_ledger_verified is True
     assert state.state_timestamp.tzinfo is not None
+

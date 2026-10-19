@@ -174,3 +174,4 @@ def consistency_adjust(
                 out1, out2 = common, common
 
     return qty, out1, out2, room
+

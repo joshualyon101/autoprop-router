@@ -112,3 +112,4 @@ def test_production_sqlite_default_uses_versioned_db_to_avoid_legacy_schema_coll
 def test_linked_account_name_extractor():
     p={"success":True,"data":[{"name":"A"},{"name":"B"},{"name":None}]}
     assert main._linked_account_names(p)=={"A","B"}
+

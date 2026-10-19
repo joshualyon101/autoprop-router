@@ -132,3 +132,4 @@ def realized_by_ny_day(fills: Iterable[dict[str, Any]], *, point_value: float = 
 def current_ny_realized(fills: Iterable[dict[str, Any]], now: datetime | None = None) -> float:
     now = now or datetime.now(timezone.utc)
     return realized_by_ny_day(fills).get(ny_date(now), 0.0)
+

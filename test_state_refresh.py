@@ -51,3 +51,4 @@ async def test_durable_fill_pagination_is_exhaustive():
             return {"data":[{"executionId":"b"}],"nextCursor":None}
     c=P(); rows=await durable_fills(c,"acct",datetime(2026,9,1,tzinfo=timezone.utc),NOW)
     assert [x["executionId"] for x in rows]==["a","b"] and len(c.calls)==2
+

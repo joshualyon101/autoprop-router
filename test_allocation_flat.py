@@ -52,3 +52,4 @@ def test_realized_loss_below_old_1_8r_threshold_does_not_block_asw():
     plan=CanonicalPlan(event_id="e",engine="ASW",side="LONG",entry=100,stop=90,tp1=120,source_qty=1,contract_risk_dollars=20,native_time_ms=int(NOW.timestamp()*1000),expiry_time_ms=int((NOW+timedelta(minutes=45)).timestamp()*1000),contract_version="ASW_LIMIT_V1")
     a=allocate_asw(plan,personal(),state(realized_today=-1000),now=NOW)
     assert a.qty == 1
+

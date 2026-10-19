@@ -846,7 +846,8 @@ class Store:
 
     def reserve_state_fallback_wave(self, event_key: str, *, max_entry_waves: int,
                                     max_duration_seconds: float,
-                                    failures: list[dict] | None = None) -> dict:
+                                    failures: list[dict] | None = None,
+                                    unlimited: bool = False) -> dict:
         """Atomically admit/count one signal wave, or reject before broker mutation."""
         now = time.time()
         event_key = str(event_key)
@@ -873,6 +874,13 @@ class Store:
             if event_key and event_key in keys:
                 decision = "DUPLICATE_ALREADY_COUNTED"
                 allowed = True
+            elif unlimited:
+                used += 1
+                if event_key:
+                    keys.append(event_key)
+                    keys = keys[-100:]
+                decision = "LAST_KNOWN_WAVE_RESERVED"
+                allowed = True
             elif max_duration_seconds <= 0 or elapsed >= max_duration_seconds:
                 decision = "DURATION_EXHAUSTED"
                 allowed = False
@@ -898,6 +906,7 @@ class Store:
                 "max_duration_seconds": max_duration_seconds,
                 "elapsed_seconds": elapsed,
                 "last_decision": decision,
+                "unlimited_while_armed": bool(unlimited),
             })
             conn.execute(
                 "INSERT INTO runtime_state(key,payload) VALUES('state_fallback_episode',?) "
@@ -1515,3 +1524,4 @@ class Store:
             c.execute("UPDATE active_trades SET payload=? WHERE account_id=?",
                       (trade.model_dump_json(), trade.account_id))
             return True
+

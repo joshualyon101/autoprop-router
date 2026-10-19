@@ -67,3 +67,4 @@ async def test_entry_fill_price_rejects_overfill():
     r.client = FillClient([{"id": 1, "qty": 3, "price": 100.25}])
     with pytest.raises(ProtectionFailure, match="exceed"):
         await r.entry_fill_price("123", 2)
+

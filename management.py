@@ -93,3 +93,4 @@ def silver_lock_stop(trade: ActiveTrade, stage: int) -> StopDecision:
     tightened = _tighten(trade.side, trade.current_stop, candidate)
     reason = "SILVER_2R_LOCK_0.25R" if stage == 1 else "SILVER_3R_LOCK_0.50R"
     return StopDecision(tightened if tightened != trade.current_stop else None, reason)
+

@@ -615,3 +615,4 @@ async def test_asw_reconcile_retains_ownership_until_orders_terminal(
     assert second["results"][0]["status"] == expected
     assert store.get_asw_pending("A1") is None
     assert store.get_trade("A1") is None
+

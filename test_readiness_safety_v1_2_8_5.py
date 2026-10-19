@@ -162,3 +162,4 @@ async def test_live_readiness_disarms_for_snapshot_working_orders(monkeypatch, t
     assert result["configuration_ready"] is False
     assert result["broker_mutation_armed"] is False
     assert any("working order" in p for p in result["problems"])
+

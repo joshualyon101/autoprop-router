@@ -22,7 +22,9 @@ from org_reentry import prove_prior_org_stop
 from state import StateUnverified, ny_date
 from state_refresh import refresh_account_state, durable_fills
 from state_fallback import (
-    allocate_asw_state_fallback, allocate_state_fallback,
+    allocate_asw_last_known_state, allocate_asw_state_fallback,
+    allocate_last_known_state, allocate_state_fallback,
+    armed_last_known_enabled, circuit_blocks_new_entry,
     is_transient_state_failure,
 )
 from store import Store
@@ -720,7 +722,7 @@ class LiveRouter:
             raise ValueError('ASW_WORKING_LIMIT missing canonical ASW plan')
         circuit_fn = getattr(self.store, 'entry_circuit', None)
         circuit = circuit_fn() if circuit_fn is not None else {'open': False}
-        if circuit.get('open'):
+        if circuit_blocks_new_entry(circuit, self.settings):
             return {'kind': 'ASW_WORKING_LIMIT', 'engine': 'ASW', 'results': [
                 {'account_id': a.account_id,
                  'status': 'SKIP' if not a.enabled else 'ERROR',
@@ -759,7 +761,9 @@ class LiveRouter:
 
         def admitted() -> bool:
             return (time.time() < deadline_epoch
-                    and not self.store.entry_circuit().get('open')
+                    and not circuit_blocks_new_entry(
+                        self.store.entry_circuit(), self.settings
+                    )
                     and not self.store.unresolved_entry_attempt_count()
                     and not self.store.entry_aborted_after('ASW', admission_epoch))
 
@@ -780,9 +784,12 @@ class LiveRouter:
                     if not is_transient_state_failure(exc):
                         raise
                     fallback_reason = str(exc)
-                    alloc = allocate_asw_state_fallback(
+                    cached = self.store.get_cached_account_state(rule.account_id)
+                    alloc = (allocate_asw_last_known_state(
+                        event.plan, rule, cached, reason=fallback_reason
+                    ) if cached is not None else allocate_asw_state_fallback(
                         event.plan, rule, self.settings, reason=fallback_reason
-                    )
+                    ))
                 else:
                     try:
                         alloc = allocate_asw(
@@ -794,9 +801,12 @@ class LiveRouter:
                         if not is_transient_state_failure(exc):
                             raise
                         fallback_reason = str(exc)
-                        alloc = allocate_asw_state_fallback(
+                        cached = self.store.get_cached_account_state(rule.account_id)
+                        alloc = (allocate_asw_last_known_state(
+                            event.plan, rule, cached, reason=fallback_reason
+                        ) if cached is not None else allocate_asw_state_fallback(
                             event.plan, rule, self.settings, reason=fallback_reason
-                        )
+                        ))
                 asw_allocations[rule.account_id] = alloc
                 if fallback_reason:
                     fallback_failures.append({
@@ -831,6 +841,7 @@ class LiveRouter:
                     self.settings, 'STATE_FALLBACK_MAX_DURATION_SECONDS', 3600.0
                 )),
                 failures=fallback_failures,
+                unlimited=armed_last_known_enabled(self.settings),
             )
             if not fallback_reservation.get('allowed'):
                 decision = str(fallback_reservation.get('decision') or 'EXHAUSTED')
@@ -1314,7 +1325,7 @@ class LiveRouter:
             getattr(self.settings, 'ENTRY_SIGNAL_MAX_AGE_SECONDS', 8.0)
         )
         circuit = self.store.entry_circuit()
-        if circuit.get('open'):
+        if circuit_blocks_new_entry(circuit, self.settings):
             reason = f"entry circuit open: {circuit.get('reason') or 'manual reset required'}"
             return {'kind': 'ENTRY', 'engine': event.plan.engine,
                     'results': [
@@ -1345,19 +1356,26 @@ class LiveRouter:
         # Production uses one all-account snapshot. Assigned test doubles from prior releases
         # may expose only the old entry_gate seam, which remains a non-production fallback.
         legacy_gate = 'entry_gate' in self.__dict__ and not hasattr(self, 'client')
+        snapshot_degraded_reason = ''
         try:
             cards = {} if legacy_gate else await self._entry_snapshot()
         except Exception as exc:
-            reason = f'entry batch preflight failed: {exc}'
-            self.store.trip_entry_circuit(reason=reason, event_key=event_key,
-                                          outcome='PREFLIGHT_FAILED')
-            return {'kind': 'ENTRY', 'engine': event.plan.engine,
-                    'results': [
-                        {'account_id': rule.account_id,
-                         'status': 'SKIP' if not rule.enabled else 'ERROR',
-                         'reason': 'disabled' if not rule.enabled else reason}
-                        for rule in accounts
-                    ], 'global_execution_error': reason}
+            if not armed_last_known_enabled(self.settings):
+                reason = f'entry batch preflight failed: {exc}'
+                self.store.trip_entry_circuit(reason=reason, event_key=event_key,
+                                              outcome='PREFLIGHT_FAILED')
+                return {'kind': 'ENTRY', 'engine': event.plan.engine,
+                        'results': [
+                            {'account_id': rule.account_id,
+                             'status': 'SKIP' if not rule.enabled else 'ERROR',
+                             'reason': 'disabled' if not rule.enabled else reason}
+                            for rule in accounts
+                        ], 'global_execution_error': reason}
+            # PLACE carries requireMarketPosition=flat and maxPositions=1. During a
+            # read-only outage, let that broker-side atomic gate replace the unavailable
+            # snapshot instead of dropping the complete signal wave.
+            cards = {}
+            snapshot_degraded_reason = str(exc)
 
         unresolved_accounts = {
             a.account_id for a in self.store.all_entry_attempts(
@@ -1381,10 +1399,12 @@ class LiveRouter:
                 if legacy_gate:
                     await self.entry_gate(rule)
                     before_ids: set[str] = set()
-                else:
+                elif rule.crosstrade_account in cards:
                     before_ids = self._snapshot_entry_gate(
                         rule, cards[rule.crosstrade_account]
                     )
+                else:
+                    before_ids = set()
                 if event.plan.engine == 'ORG' and event.plan.reentry:
                     prior = self.store.get_org_attempt(rule.account_id)
                     if not prior:
@@ -1407,9 +1427,12 @@ class LiveRouter:
                         raise
                     fallback_reason = str(exc)
                     try:
-                        alloc = allocate_state_fallback(
+                        cached = self.store.get_cached_account_state(rule.account_id)
+                        alloc = (allocate_last_known_state(
+                            event.plan, rule, cached, reason=fallback_reason
+                        ) if cached is not None else allocate_state_fallback(
                             event.plan, rule, self.settings, reason=fallback_reason
-                        )
+                        ))
                     except AllocationBlocked as fallback_exc:
                         return None, {
                             'account_id': rule.account_id, 'status': 'SKIP',
@@ -1432,9 +1455,12 @@ class LiveRouter:
                             raise
                         fallback_reason = str(exc)
                         try:
-                            alloc = allocate_state_fallback(
+                            cached = self.store.get_cached_account_state(rule.account_id)
+                            alloc = (allocate_last_known_state(
+                                event.plan, rule, cached, reason=fallback_reason
+                            ) if cached is not None else allocate_state_fallback(
                                 event.plan, rule, self.settings, reason=fallback_reason
-                            )
+                            ))
                         except AllocationBlocked as fallback_exc:
                             return None, {
                                 'account_id': rule.account_id, 'status': 'SKIP',
@@ -1492,6 +1518,7 @@ class LiveRouter:
                     self.settings, 'STATE_FALLBACK_MAX_DURATION_SECONDS', 3600.0
                 )),
                 failures=fallback_failures,
+                unlimited=armed_last_known_enabled(self.settings),
             )
             if not fallback_reservation.get('allowed'):
                 decision = str(fallback_reservation.get('decision') or 'EXHAUSTED')
@@ -1575,7 +1602,9 @@ class LiveRouter:
         def admitted() -> bool:
             return (not wave_abort.is_set()
                     and not self.store.entry_aborted_after(event.plan.engine, receipt_epoch)
-                    and not self.store.entry_circuit().get('open'))
+                    and not circuit_blocks_new_entry(
+                        self.store.entry_circuit(), self.settings
+                    ))
 
         # One all-or-none SQLite transition replaces one FULL-sync transaction per
         # destination. All rows become conservatively SUBMITTING immediately before the
@@ -1865,6 +1894,11 @@ class LiveRouter:
             out['global_execution_error'] = global_instrument_error
         if fallback_reservation is not None:
             out['state_fallback'] = fallback_reservation
+        if snapshot_degraded_reason:
+            out['position_preflight'] = {
+                'status': 'BROKER_SIDE_GUARD',
+                'reason': snapshot_degraded_reason,
+            }
         return out
 
     def _schedule_entry_reconcile(self, attempt: EntryAttempt, error: str) -> None:
@@ -2833,3 +2867,4 @@ class LiveRouter:
                 'reason': 'EXIT ownership/position state remains unconfirmed; retrying',
             })
         return out
+

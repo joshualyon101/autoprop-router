@@ -109,3 +109,4 @@ as warnings while the bounded fallback is available; hard failures remain proble
 
 Read `RELEASE_AUDIT.md` for the implementation and regression-test record. The package
 contains no credentials, account configuration, account state, or Railway volume data.
+

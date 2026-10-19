@@ -187,3 +187,4 @@ def parse_alert(raw: str) -> ParsedEvent:
     if engine == "ACCOUNT" or action == "ACCOUNT":
         return ParsedEvent(kind="ACCOUNT", engine=engine, side=side, fields=d, raw=raw)
     return ParsedEvent(kind=action, engine=engine, side=side, fields=d, raw=raw)
+

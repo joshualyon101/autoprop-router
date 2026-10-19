@@ -16,3 +16,4 @@ def prove_prior_org_stop(*, fills: Iterable[Mapping[str, Any]], stop_order_ids: 
         if oid in stop_order_ids and int(float(f.get("qty", 0) or 0)) > 0:
             return True
     return False
+

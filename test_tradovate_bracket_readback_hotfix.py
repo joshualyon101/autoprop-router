@@ -302,3 +302,4 @@ async def test_change_waits_for_final_report_without_resending(initial):
 
     assert client.change_calls == 1
     assert client.lifecycle_calls == 3  # baseline, pending/missing, final Replaced+Success
+

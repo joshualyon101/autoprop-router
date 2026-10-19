@@ -297,3 +297,4 @@ async def test_mutation_timeout_is_logged_but_never_resent(monkeypatch):
         await client._request('POST', '/v1/api/tv/accounts/private/orders')
     assert calls[0] == 1
     assert client.transport_diagnostics['last_transport_failure']['exhausted'] is True
+

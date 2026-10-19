@@ -204,3 +204,4 @@ class AutoPropRouter:
             mode=(self.settings.execution_mode if self.settings.live_enabled else "shadow"),
             management_mode=self.settings.management_mode,router_processing_ms=(time.perf_counter()-t0)*1000,decisions=decisions)
         self.store.log_route(signal.trade_id,r.model_dump(mode="json")); return r
+

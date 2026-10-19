@@ -65,3 +65,4 @@ def test_consistency_size_first_and_target_clip():
     assert qty == 1
     # 1-contract TP1 natural profit is $100, so it fits exactly.
     assert tp1 == 20050
+

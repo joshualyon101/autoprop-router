@@ -72,3 +72,4 @@ def test_core_consistency_matches_golden_grid():
       for realized in (-300,0,500,1100,1149,1150,1199):
         kw=dict(pre_qty=pre,tp1_profit_per_contract=50,tp2_profit_per_contract=150,min_runner_qty=2,realized_today=realized,enabled=True,ceiling_fraction=.4,base_target=3000)
         assert p.core_consistency_qty(**kw)==g.core_consistency_qty(**kw)
+

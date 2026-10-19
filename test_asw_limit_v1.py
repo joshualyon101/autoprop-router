@@ -211,3 +211,4 @@ async def test_cancel_pending_flattens_broker_fill_if_pine_still_pending(tmp_pat
     out=await r.cancel_asw_pending(event)
     assert c.flatten_calls and r.store.get_asw_pending('A') is None
     assert out['results'][0]['status']=='CANCELED_FLATTENED'
+

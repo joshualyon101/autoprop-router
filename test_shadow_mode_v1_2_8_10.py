@@ -367,3 +367,4 @@ async def test_shadow_startup_launches_only_one_observer_worker(monkeypatch, tmp
     assert main._silver_management_task is None
     assert main._state_refresh_task is None
     assert main._auto_discovery_task is None
+

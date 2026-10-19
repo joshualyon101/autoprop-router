@@ -453,3 +453,4 @@ async def test_submit_wave_is_not_blocked_by_fill_or_position_verification(
     # Fill/position proof belongs to the separate reconciliation loop.
     assert verification_calls == 0
     release_verification.set()
+

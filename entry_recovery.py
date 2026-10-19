@@ -118,3 +118,4 @@ async def recover_readback_circuit(router) -> dict:
             return report('BLOCKED', 'atomic reset refused: state or ownership changed')
         return report('RECOVERED', confirmations=count, required_confirmations=required,
                       reset_at_epoch=reset['reset_at_epoch'])
+

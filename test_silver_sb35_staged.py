@@ -126,3 +126,4 @@ async def test_live_stage2_advances_and_late_stage1_cannot_loosen():
 
 def test_contract_identity():
     assert SILVER_STOP_CONTRACT == 'SILVER_SB35_STAGE_V1'
+

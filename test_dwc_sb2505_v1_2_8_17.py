@@ -455,3 +455,4 @@ async def test_idle_dwc_loop_performs_no_broker_reads(tmp_path):
     rt=runtime(tmp_path)
     assert (await service_intents(rt))["status"]=="IDLE"
     assert not rt.read_calls and not rt.executor.calls
+

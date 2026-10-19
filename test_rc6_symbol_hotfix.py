@@ -314,3 +314,4 @@ def test_webhook_inbox_endpoint_backfills_legacy_all_destination_failure(monkeyp
     summary = payload["events"][0]["result"]["execution_summary"]
     assert summary["outcome"] == "ALL_DESTINATIONS_FAILED"
     assert summary["execution_errors"] == 8
+

@@ -34,3 +34,4 @@ async def test_snapshot_normalizer_and_eod_mll(tmp_path: Path):
     s = (await cache.snapshot())["a"]
     assert s.mll_floor == 48500
     assert s.cushion == 2000
+

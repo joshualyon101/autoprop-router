@@ -80,3 +80,4 @@ def infer_account_config(
         enabled=False, rules_verified=False, risk_ready=False,
         auto_discovered=True, profile_source="unclassified"
     )
+

@@ -108,3 +108,4 @@ async def test_actual_shadow_endpoint_accepts_final_pine_contract(monkeypatch, t
     recorded = store.get_runtime_state(ShadowObserver.LAST_EVENT_KEY)
     assert recorded["regime_sizing"]["verification"] == "MATCH"
     assert main._SHADOW_MODE is True
+

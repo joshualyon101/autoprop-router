@@ -141,3 +141,4 @@ async def test_core_short_target_tiers_normalize_by_side_absolute_price():
     r=await e.place_core("acct",a,"AP_short")
     assert set(r.child_order_ids)=={"t1","s1","t2","s2"}
     assert verify_core_bracket(c.rows,a,set(r.child_order_ids))
+

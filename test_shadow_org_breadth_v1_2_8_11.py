@@ -76,3 +76,4 @@ async def test_legacy_org_entry_remains_observable_without_regime_diagnostic():
     result = await observer.observe(event, "legacy", 1.0)
     assert result["action"] == "WOULD_ENTER"
     assert "regime_sizing" not in result
+

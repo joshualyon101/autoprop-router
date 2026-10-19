@@ -42,3 +42,4 @@ def test_core_destination_split_is_from_destination_qty():
     plan=CanonicalPlan(event_id="e",engine="CORE",side="LONG",entry=100,stop=90,tp1=120,tp2=140,module="CORE",source="ORL",score=4)
     a=allocate(plan,personal(),state(),now=NOW)
     assert (a.tp1_qty,a.runner_qty)==((a.qty+1)//2,a.qty//2)
+

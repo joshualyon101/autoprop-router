@@ -95,3 +95,4 @@ async def test_snapshot_refresh_pending_get_retries_then_succeeds(monkeypatch):
     out = await c._request("GET", "/v1/api/tv/accounts/a")
     assert out == {"ok": True}
     assert calls == 2
+

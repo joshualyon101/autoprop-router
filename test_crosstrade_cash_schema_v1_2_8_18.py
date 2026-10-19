@@ -28,3 +28,4 @@ def test_total_cash_value_precedes_cash_usd_fallback():
 def test_net_liq_alone_remains_rejected():
     with pytest.raises(AutoOnboardingRejected, match="closed-cash balance is missing"):
         _closed_cash({"balance": {"netLiq": 50_125}})
+

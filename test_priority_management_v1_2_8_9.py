@@ -209,3 +209,4 @@ async def test_background_state_refresh_pauses_for_unresolved_exposure():
     router.state_for = forbidden
     result = await router.refresh_state_cache()
     assert result == {'paused_for_safety': True, 'results': []}
+

@@ -185,3 +185,4 @@ def test_unknown_execution_mode_fails_closed():
     assert result["configuration_ready"] is False
     assert "supported execution modes are live or shadow" in result["problems"]
     assert result["broker_mutation_armed"] is False
+

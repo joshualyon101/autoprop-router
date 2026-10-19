@@ -84,3 +84,4 @@ async def main():
     print('AutoProp Router v1.0.0 RC1 production tests PASS')
 
 asyncio.run(main())
+

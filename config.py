@@ -33,3 +33,4 @@ def load_risk_states(env_json: str = '') -> list[VerifiedRiskState]:
     if isinstance(data, dict):
         data = list(data.values())
     return [VerifiedRiskState.model_validate(x) for x in (data or [])]
+

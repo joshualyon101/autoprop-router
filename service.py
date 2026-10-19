@@ -51,3 +51,4 @@ async def fanout_entry(event: ParsedEvent, accounts: list[AccountRule],
         await execute(rule, alloc)
         out.append(RouteResult(rule.account_id, "ROUTED", allocation=alloc))
     return out
+

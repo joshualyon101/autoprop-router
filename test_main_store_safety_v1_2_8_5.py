@@ -648,3 +648,4 @@ async def test_accepted_read_timeout_stays_accepted_and_opens_circuit_without_fl
     assert circuit["open"] is True
     assert circuit["outcome"] == "READBACK_UNCONFIRMED"
     assert client.flatten_calls == 0
+

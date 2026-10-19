@@ -88,11 +88,11 @@ class Settings(BaseSettings):
     SILVER_MANAGEMENT_RETRY_MAX_SECONDS: float = 5.0
     ENTRY_STATE_CACHE_MAX_AGE_SECONDS: float = 20.0
     STARTUP_STATE_WARM_TIMEOUT_SECONDS: float = 20.0
-    # A transient broker state-read outage may use conservative configuration-only
-    # sizing for at most five entry waves and at most one hour. The sixth fallback wave,
-    # or the first wave after the time limit, trips the new-risk circuit. A complete live
-    # refresh resets the episode automatically. Auth/config/account-status errors never
-    # qualify for fallback.
+    # When explicitly armed, read-only broker outages use the durable last verified
+    # account state and broker-side flat/max-position admission. Mutation ambiguity,
+    # unresolved attempts, protection failures, and persistence failures remain blocking.
+    ARMED_LAST_KNOWN_STATE_EXECUTION: bool = True
+    # Compatibility limits apply only when armed last-known execution is disabled.
     STATE_FALLBACK_ENABLED: bool = True
     STATE_FALLBACK_MAX_ENTRY_WAVES: int = 5
     STATE_FALLBACK_MAX_DURATION_SECONDS: float = 3600.0
@@ -106,3 +106,4 @@ class Settings(BaseSettings):
     ASW_PENDING_RECONCILE_SECONDS: float = 10.0
     ASW_PROTECTION_CONFIRM_RETRIES: int = 4
     ASW_PROTECTION_CONFIRM_RETRY_DELAY_SECONDS: float = 0.25
+

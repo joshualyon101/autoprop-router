@@ -191,3 +191,4 @@ async def test_read_uncertainty_retains_native_atm_and_opens_entry_circuit(
     assert store.entry_circuit()["outcome"] == (
         "CORE_NORMALIZATION_READBACK_PENDING"
     )
+

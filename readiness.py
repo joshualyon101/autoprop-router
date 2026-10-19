@@ -66,3 +66,4 @@ def readiness(settings: Settings, accounts: list[AccountRule]) -> dict:
         'registered_accounts': len(accounts),
         'enabled_accounts': len(enabled),
     }
+

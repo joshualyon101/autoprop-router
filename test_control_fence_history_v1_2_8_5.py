@@ -341,3 +341,4 @@ def test_attempt_query_tolerates_reversed_legacy_interval(tmp_path):
     assert store.relevant_control_fence_info(
         "ORG", submit_started_epoch=20.0, accepted_at_epoch=10.0
     )["event_key"] == "inside-reversed"
+

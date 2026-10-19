@@ -25,7 +25,9 @@ from management import SILVER_STOP_CONTRACT
 from dwc_protection import DWC_STOP_CONTRACT, blocks_new_entry as dwc_blocks_new_entry
 from onboarding import discover_and_onboard
 from shadow import ShadowObserver
-from state_fallback import is_transient_state_failure
+from state_fallback import (
+    armed_last_known_enabled, circuit_blocks_new_entry, is_transient_state_failure,
+)
 
 settings = Settings()
 _EXECUTION_MODE = str(settings.AUTOPROP_EXECUTION_MODE or '').strip().lower()
@@ -176,7 +178,8 @@ async def _webhook_worker(*, control: bool = False):
             if not _SHADOW_MODE:
                 if new_risk and not settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
                     raise RuntimeError('worker disarmed: TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false')
-                if new_risk and store.entry_circuit().get('open'):
+                if new_risk and circuit_blocks_new_entry(
+                        store.entry_circuit(), settings):
                     raise RuntimeError(
                         f"new-risk circuit open: {store.entry_circuit().get('reason') or 'reset required'}"
                     )
@@ -594,8 +597,9 @@ def health():
     shadow_last = shadow_summary.get('last_event') or {}
     shadow_ready = bool(base.get('shadow_observation_ready', base['configuration_ready']))
     state_fallback = store.state_fallback_status()
+    circuit_blocks = circuit_blocks_new_entry(circuit, settings)
     broker_armed = False if _SHADOW_MODE else (
-        base['broker_mutation_armed'] and not circuit.get('open') and unresolved == 0
+        base['broker_mutation_armed'] and not circuit_blocks and unresolved == 0
         and not silver_intent and not store.dwc_stop_pending()
     )
     return {
@@ -640,6 +644,8 @@ def health():
         'asw_pending_limits': len(store.all_asw_pending()),
         'entry_circuit_open': bool(circuit.get('open')),
         'entry_circuit_reason': str(circuit.get('reason') or ''),
+        'entry_circuit_blocks_new_entries': bool(circuit_blocks),
+        'armed_last_known_state_execution': armed_last_known_enabled(settings),
         'readback_auto_recovery_enabled': bool(getattr(
             settings, 'READBACK_AUTO_RECOVERY_ENABLED', True
         )) and _LIVE_MODE,
@@ -827,8 +833,13 @@ async def live_readiness(token: str):
         raise HTTPException(409, 'entry wave started during readiness; retry after dispatch')
     circuit = store.entry_circuit()
     state_fallback = store.state_fallback_status()
+    circuit_blocks = circuit_blocks_new_entry(circuit, settings)
     circuit_problems = ([f"entry circuit open: {circuit.get('reason') or 'manual reset required'}"]
-                        if circuit.get('open') else [])
+                        if circuit_blocks else [])
+    if circuit.get('open') and not circuit_blocks:
+        discovery_warnings.append(
+            'read-only entry circuit is degraded but non-blocking while armed'
+        )
     unresolved = store.unresolved_entry_attempt_count()
     unresolved_problems = ([f'{unresolved} unresolved entry attempt(s) require reconciliation']
                            if unresolved else [])
@@ -1139,7 +1150,7 @@ async def webhook(token: str, request: Request):
     if new_risk and not settings.TRADINGVIEW_ALERT_CONTRACT_VERIFIED:
         return {'accepted': False, 'disarmed': True, 'kind': event.kind,
                 'reason': 'TRADINGVIEW_ALERT_CONTRACT_VERIFIED=false'}
-    if new_risk and store.entry_circuit().get('open'):
+    if new_risk and circuit_blocks_new_entry(store.entry_circuit(), settings):
         raise HTTPException(503, {
             'reason': 'new-risk circuit open',
             'entry_circuit': store.entry_circuit(),
@@ -1210,3 +1221,4 @@ async def webhook(token: str, request: Request):
         'event_key': event_key,
         'safety_control_allowed_while_disarmed': (not new_risk),
     }
+

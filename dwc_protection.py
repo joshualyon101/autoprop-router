@@ -283,3 +283,4 @@ async def service_intents(rt: Any) -> dict:
             all_results.append({"signal_id": sid, "status": status, "results": results})
         return {"kind": "DWC_STOP_SERVICE", "status": "SERVICED" if progressed else "BACKOFF",
                 "results": all_results}
+

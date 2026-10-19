@@ -41,3 +41,4 @@ def render_account_manager(*,token,registry,states,overrides,mode,management_mod
     <h2>Discovered accounts</h2><table><thead><tr><th>Account</th><th>Profile</th><th>Phase</th><th>Start</th><th>Balance</th><th>MLL</th><th>Cushion</th><th>Risk ready</th><th>Source</th><th></th></tr></thead><tbody>{''.join(rows)}</tbody></table>
     <h2>Manual overrides / MLL bootstrap</h2>{''.join(forms)}</body></html>"""
     return HTMLResponse(html)
+

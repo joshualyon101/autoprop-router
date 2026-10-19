@@ -1089,3 +1089,4 @@ class Executor:
             raise ProtectionFailure('stop change exact readback/coverage failed')
         self._require_current(still_current)
         return [_order_id(o) for o in exact if _order_id(o)]
+

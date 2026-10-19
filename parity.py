@@ -296,3 +296,4 @@ def natural_qty(*, risk_budget: float, risk_pc: float, cap: int,
         if core_funded_buffer:
             q = min(q, funded_core_safe_qty(cushion=funded_cushion, risk_per_contract=risk_pc))
     return max(0, q)
+

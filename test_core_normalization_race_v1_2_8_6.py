@@ -289,3 +289,4 @@ async def test_owned_child_lifecycle_reads_are_parallelized():
     assert client.maximum == 4
     assert len(rows) == 4
     assert owned == {f"child-{i}" for i in range(4)}
+

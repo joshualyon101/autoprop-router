@@ -515,3 +515,4 @@ class CrossTradeClient:
         symbol = normalize_tradovate_symbol(instrument)
         return await self._request("POST", f"/v1/api/tv/accounts/{account}/positions/flatten",
                                    json={"instrument": symbol})
+

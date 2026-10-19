@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import math
 
-from allocation import AllocationBlocked, org_regime_quantity, validate_org_regime
+from allocation import (
+    AllocationBlocked, allocate, allocate_asw, org_regime_quantity,
+    validate_org_regime,
+)
 from crosstrade import CrossTradeError, RateLimitExceeded
-from models import AccountRule, Allocation, CanonicalPlan
+from models import AccountRule, AccountState, Allocation, CanonicalPlan
 from parity import (
     MNQ_POINT_VALUE, addon_risk_multiplier, core_risk_multiplier, core_split,
     engine_contract_cap, risk_per_contract,
@@ -56,6 +59,63 @@ def is_transient_state_failure(error: Exception | str) -> bool:
     if isinstance(error, CrossTradeError):
         return any(marker in text for marker in _TRANSIENT_MARKERS)
     return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def armed_last_known_enabled(settings) -> bool:
+    """Whether an intentionally armed router may trade through read-only outages."""
+    return bool(getattr(settings, "ARMED_LAST_KNOWN_STATE_EXECUTION", False))
+
+
+def circuit_blocks_new_entry(circuit: dict, settings) -> bool:
+    """Keep mutation ambiguity hard-blocking while allowing read-only degradation.
+
+    This never bypasses unresolved durable entry attempts; callers retain that separate
+    gate.  It only makes circuits owned by account/position *reads* non-blocking.
+    """
+    if not circuit.get("open"):
+        return False
+    if not armed_last_known_enabled(settings):
+        return True
+    outcome = str(circuit.get("outcome") or "")
+    reason = str(circuit.get("reason") or "").lower()
+    if outcome in {
+        "STATE_FALLBACK_EXHAUSTED", "STATE_FALLBACK_EXPIRED",
+        "STARTUP_STATE_CACHE_UNREADY", "PREFLIGHT_FAILED",
+    }:
+        return False
+    if outcome == "PREPARATION_FAILED" and is_transient_state_failure(reason):
+        return False
+    if outcome == "OWNED_ORDER_CLEANUP_UNCONFIRMED":
+        read_only = any(marker in reason for marker in (
+            "plural-position proof", "position proof", "readtimeout",
+            "network error", "snapshot_refresh_pending", "broker_rate_limited",
+        ))
+        cleanup_failure = any(marker in reason for marker in (
+            "owned-order cleanup failed", "cancel", "working order",
+        ))
+        if read_only and not cleanup_failure:
+            return False
+    return True
+
+
+def allocate_last_known_state(plan: CanonicalPlan, rule: AccountRule,
+                              state: AccountState, *, reason: str) -> Allocation:
+    """Size from the durable last verified state while ignoring only its age."""
+    alloc = allocate(plan, rule, state, max_state_age_seconds=float("inf"))
+    return alloc.model_copy(update={
+        "state_fallback": True,
+        "state_fallback_reason": f"last-known state: {reason}"[:1000],
+    })
+
+
+def allocate_asw_last_known_state(plan: CanonicalPlan, rule: AccountRule,
+                                  state: AccountState, *, reason: str) -> Allocation:
+    """ASW equivalent of :func:`allocate_last_known_state`."""
+    alloc = allocate_asw(plan, rule, state, max_state_age_seconds=float("inf"))
+    return alloc.model_copy(update={
+        "state_fallback": True,
+        "state_fallback_reason": f"last-known state: {reason}"[:1000],
+    })
 
 
 def fallback_base_risk(rule: AccountRule, settings) -> float:
@@ -186,3 +246,4 @@ def allocate_asw_state_fallback(plan: CanonicalPlan, rule: AccountRule, settings
         base_risk=base, effective_risk_budget=budget, risk_per_contract=rpc,
         state_fallback=True, state_fallback_reason=str(reason)[:1000],
     )
+

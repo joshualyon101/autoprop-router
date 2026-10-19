@@ -328,3 +328,4 @@ async def test_live_half_reentry_preserves_destination_stop_proof_gate(
     assert all(rows[account]["status"] == "SKIP" and
                "destination stop outcome not proven" in rows[account]["reason"]
                for account in ("B", "C"))
+

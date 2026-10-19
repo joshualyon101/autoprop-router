@@ -42,3 +42,4 @@ async def test_entry_snapshot_uses_fast_mutation_pacing_without_bypassing_limite
     assert observed[0]["reserve_tokens"] == 0.0
     assert observed[1]["min_interval_seconds"] == pytest.approx(0.10)
     assert observed[1]["reserve_tokens"] == 9.0
+

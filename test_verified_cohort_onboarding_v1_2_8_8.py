@@ -511,3 +511,4 @@ async def test_registry_change_never_alters_inflight_signal_but_joins_next_signa
     assert router.executor.submitted[-2:] == [
         first.crosstrade_account, newly_onboarded.crosstrade_account,
     ]
+
